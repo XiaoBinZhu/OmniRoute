@@ -18,6 +18,7 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { requireOptionalNative } from "../../bin/cli/runtime/opaqueImport.mjs";
 
 /**
  * Resolve the repository/package root that holds `.env` / `.env.example`.
@@ -136,7 +137,12 @@ function hasEncryptedCredentials(dataDir) {
     // bundled into a standalone route, a top-level `createRequire(import.meta.url)`
     // throws during module evaluation and 500s the whole route (#5006). Inside this
     // guarded block, any failure simply returns false (the safe default below).
-    const Database = require("better-sqlite3");
+    //
+    // The request goes through requireOptionalNative() so the bundler does not
+    // resolve (and warn about) better-sqlite3, which is legitimately absent
+    // whenever its native build was skipped — see
+    // bin/cli/runtime/opaqueImport.mjs.
+    const Database = requireOptionalNative(require, "better-sqlite3");
     const db = new Database(dbPath, { readonly: true, fileMustExist: true });
     try {
       const row = db

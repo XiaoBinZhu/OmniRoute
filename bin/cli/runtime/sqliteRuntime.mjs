@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { execSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { validateBinaryMagic, platformBinaryLabel } from "./magicBytes.mjs";
+import { importOptionalNative } from "./opaqueImport.mjs";
 
 const RUNTIME_DIR = join(homedir(), ".omniroute", "runtime");
 // Exported so the packaging coherence guard (tests/unit/pack-boot-runtime-paths.test.ts)
@@ -79,7 +80,10 @@ export async function loadSqliteRuntime() {
 
 async function tryLoadBundled() {
   try {
-    const mod = await import("better-sqlite3");
+    // Loaded through the runtime so the bundler does not try to resolve (and
+    // warn about) a package that is legitimately absent when its native build
+    // was skipped — see ./opaqueImport.mjs.
+    const mod = await importOptionalNative("better-sqlite3");
     return { kind: "better-sqlite3", Database: mod.default ?? mod };
   } catch {
     return null;
