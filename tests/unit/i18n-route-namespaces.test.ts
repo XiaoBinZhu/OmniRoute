@@ -61,6 +61,17 @@ test("every dashboard section has a SectionI18nProvider layout", () => {
   );
 });
 
+test("the /home route mounts the home SectionI18nProvider", () => {
+  // /dashboard redirects to /home, which lives outside dashboard/ — without its
+  // own provider it only receives the chrome set and the home page and its
+  // sponsor banners throw MISSING_MESSAGE.
+  const layoutPath = join(REPO_ROOT, "src", "app", "(dashboard)", "home", "layout.tsx");
+  assert.ok(existsSync(layoutPath), "src/app/(dashboard)/home/layout.tsx is missing");
+  const source = readFileSync(layoutPath, "utf8");
+  assert.ok(source.includes("SectionI18nProvider"), "home layout must mount SectionI18nProvider");
+  assert.ok(source.includes("sectionNamespaces.home"), "home layout must use the home set");
+});
+
 test("every section set includes the chrome namespaces", () => {
   const { chrome, sections, home } = JSON.parse(readFileSync(MAP_PATH, "utf8"));
   const chromeSet = new Set(chrome);

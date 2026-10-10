@@ -228,10 +228,12 @@ export function analyzeRouteNamespaces() {
   // Dashboard chrome: everything reachable from the (dashboard) root layout.
   const chrome = closureNamespaces([join(DASHBOARD_ROOT, "layout.tsx")]);
 
-  // Dashboard home: files directly under dashboard/ (page + companions).
+  // Dashboard home: files directly under dashboard/ (page + companions) and the
+  // /home route subtree that /dashboard redirects to.
   const homeFiles = readdirSync(SECTIONS_ROOT)
     .filter((name) => /\.(tsx|ts)$/.test(name))
     .map((name) => join(SECTIONS_ROOT, name));
+  homeFiles.push(...walkFiles(join(DASHBOARD_ROOT, "home")));
   const home = new Set([...chrome]);
   for (const ns of closureNamespaces(homeFiles)) home.add(ns);
 
