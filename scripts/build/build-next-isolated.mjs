@@ -136,11 +136,14 @@ function runNextBuild() {
 }
 
 export function resolveNextBuildBundlerFlag(baseEnv = process.env) {
-  // Turbopack is the default; OMNIROUTE_USE_TURBOPACK=0 is the documented escape hatch
-  // to webpack (Windows, native-binding trouble, RAM-constrained machines — #6409, and
-  // docs/reference/ENVIRONMENT.md). The choice is env-only ON PURPOSE: the variable is
-  // the operator's control and CI sets it explicitly, so sniffing the runtime here would
-  // silently override an operator who asked for Turbopack.
+  // Turbopack is the default on every runtime, Bun included (Bun 1.4+ with
+  // Next 16.3 — #11471), and OMNIROUTE_USE_TURBOPACK=0 is the documented escape
+  // hatch to webpack (Windows, native-binding trouble, RAM-constrained machines
+  // — #6409, and docs/reference/ENVIRONMENT.md). The choice is env-only ON
+  // PURPOSE: the variable is the operator's control and CI sets it explicitly,
+  // so sniffing the runtime here would silently override an operator who asked
+  // for Turbopack. `scripts/dev/bundler-flags.mjs::resolveDevBundler` implements
+  // the same contract for the dev runner, with a Bun version floor.
   if (baseEnv.OMNIROUTE_USE_TURBOPACK === "0") {
     return "--webpack";
   }
