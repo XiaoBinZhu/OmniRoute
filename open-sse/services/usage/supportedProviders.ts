@@ -52,6 +52,8 @@ export const USAGE_SUPPORTED_PROVIDERS: readonly string[] = [
   "vertex",
   "vertex-partner",
   "codebuddy-cn",
+  "codebuddy-intl",
+  "cbai",
   // PromptQL playground credits (getCreditSummary → USD micros)
   "promptql",
   "pql",
