@@ -17,7 +17,7 @@ import {
 } from "../../../src/shared/constants/modelSpecs.ts";
 import { fitThinkingToMaxTokens } from "./openai-to-claude/thinkingBudget.ts";
 import { enforceToolResultAdjacency } from "./openai-to-claude/toolResultAdjacency.ts";
-import { sanitizeToolResultId } from "./openai-to-claude/sanitizeToolResultId.ts";
+import { resolveToolResultId } from "./openai-to-claude/sanitizeToolResultId.ts";
 import {
   openAiImagePartToClaudeBlock,
   normalizeToolResultImages,
@@ -341,6 +341,10 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
       }
     };
 
+    // tool_use ids of the latest assistant turn still waiting for a result; an id-less
+    // tool result is paired with the oldest of them instead of being dropped.
+    let pendingToolUseIds: string[] = [];
+
     for (const msg of nonSystemMessages) {
       const newRole = msg.role === "user" || msg.role === "tool" ? "user" : "assistant";
       const blocks = getContentBlocksFromMessage(
@@ -353,8 +357,12 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
           provider: routedProvider,
           model,
           disabled: credentials?._videoTranscriptSensitive === true,
-        }
+        },
+        pendingToolUseIds
       );
+      if (newRole === "assistant") {
+        pendingToolUseIds = blocks.filter((b) => b.type === "tool_use").map((b) => String(b.id));
+      }
       const hasToolUse = blocks.some((b) => b.type === "tool_use");
       const hasToolResult = blocks.some((b) => b.type === "tool_result");
 
@@ -523,11 +531,11 @@ export function openaiToClaudeRequest(model, body, stream, credentials = null) {
     if (fmt.type === "json_schema" && fmt.json_schema?.schema) {
       const schemaJson = JSON.stringify(fmt.json_schema.schema, null, 2);
       systemParts.push(
-        `You must respond with valid JSON that strictly follows this JSON schema:\n\`\`\`json\n${schemaJson}\n\`\`\`\nRespond ONLY with the JSON object, no other text.`
+        `You must respond with valid JSON that strictly follows this JSON schema:\n\`\`\`json\n${schemaJson}\n\`\`\`\nRespond ONLY with the JSON object, no other text and no markdown code fences.`
       );
     } else if (fmt.type === "json_object") {
       systemParts.push(
-        "You must respond with valid JSON. Respond ONLY with a JSON object, no other text."
+        "You must respond with valid JSON. Respond ONLY with a JSON object, no other text and no markdown code fences."
       );
     }
   }
@@ -584,12 +592,13 @@ function getContentBlocksFromMessage(
   disableToolPrefix = false,
   thinkingEnabledForRequest = false,
   isKimiCoding = false,
-  thinkingBinding: { provider?: unknown; model?: unknown; disabled?: boolean } = {}
+  thinkingBinding: { provider?: unknown; model?: unknown; disabled?: boolean } = {},
+  pendingToolUseIds: string[] = []
 ) {
   const blocks = [];
 
   if (msg.role === "tool") {
-    const sanitizedToolUseId = sanitizeToolResultId(msg.tool_call_id); // #7705
+    const sanitizedToolUseId = resolveToolResultId(msg.tool_call_id, pendingToolUseIds); // #7705
     if (!sanitizedToolUseId) return blocks;
     // T02: Strip empty text blocks from nested tool_result content to avoid Anthropic 400
     // #9692: rewrite OpenAI image_url parts to Claude image blocks (same as user turns)
@@ -615,8 +624,10 @@ function getContentBlocksFromMessage(
         if (part.type === "text" && part.text) {
           blocks.push({ type: "text", text: part.text });
         } else if (part.type === "tool_result") {
-          // Skip tool_result with no tool_use_id (would be useless and may cause errors)
-          if (!part.tool_use_id) continue;
+          // Pair an id-less tool_result with the oldest pending tool_use; skip it only
+          // when nothing is pending (it would be useless and may cause errors).
+          const toolUseId = resolveToolResultId(part.tool_use_id, pendingToolUseIds);
+          if (!toolUseId) continue;
           // T02: strip empty text blocks from nested content before passing to Anthropic
           // #9692: convert OpenAI image_url nested in tool_result the same way
           const resultContent = normalizeToolResultImages(
@@ -624,7 +635,7 @@ function getContentBlocksFromMessage(
           );
           blocks.push({
             type: "tool_result",
-            tool_use_id: sanitizeToolId(part.tool_use_id), // #7705
+            tool_use_id: toolUseId, // #7705
             content: resultContent,
             // Always emit a boolean: Zed's strict Anthropic parser rejects
             // tool_result blocks with a missing `is_error` field.
