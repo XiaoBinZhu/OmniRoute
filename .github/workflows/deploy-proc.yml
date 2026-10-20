@@ -135,8 +135,12 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── 2. Optional full/dashboard image ──────────────────────────────────────
+  # Runs strictly AFTER the headless core: the gateway host never builds, and the
+  # backend artifact is the one that must exist first. A failed dashboard build
+  # therefore cannot block or invalidate the core image that gets deployed.
   build-web:
     name: build full dashboard image
+    needs: build-core
     if: github.event_name == 'workflow_dispatch' && inputs.build_web
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -171,6 +175,7 @@ jobs:
           push: true
           build-args: |
             OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_BACKEND_ONLY=0
             OMNIROUTE_BUILD_MEMORY_MB=12288
             OMNIROUTE_BUILD_WORKERS=2
           tags: ${{ steps.meta.outputs.image }}
