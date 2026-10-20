@@ -1,0 +1,119 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  OmniRoute — proc deployment (prebuilt image, NO build on the target host)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+#  Why this file exists
+#  --------------------
+#  The 43 gateway host is 2 vCPU / 4 GB. A Next.js production build needs
+#  ~9 GB RSS (2 processes × ~4.5 GB measured, see Dockerfile → OMNIROUTE_BUILD_WORKERS),
+#  so `docker compose build` there is guaranteed to be OOM-killed. This compose
+#  file therefore has **no `build:` section at all**: the image is built once by
+#  CI (or on any workstation with Docker) and pushed to a registry, and the host
+#  only pulls it.
+#
+#  Headless by default
+#  -------------------
+#  `OMNIROUTE_HEADLESS=1` boots the proxy engine only: `/v1/*`, the management
+#  `/api/*` surface (used by the `omniroute` CLI), auth and the background proxy
+#  schedulers stay on; the dashboard pages answer 404 and the dashboard-only boot
+#  subsystems are skipped. Set `OMNIROUTE_HEADLESS=0` (and use an image built
+#  with the dashboard, i.e. without OMNIROUTE_BUILD_BACKEND_ONLY=1) when the UI
+#  is needed on this host.
+#
+#  Usage
+#  -----
+#    export OMNIROUTE_IMAGE=ghcr.io/<owner>/omniroute:proc-<sha>
+#    docker compose -f docker-compose.proc.yml config      # always inspect first
+#    docker compose -f docker-compose.proc.yml up -d --no-build
+#    docker compose -f docker-compose.proc.yml ps
+#    curl -fsS http://127.0.0.1:20130/healthz
+#
+#    # optional: add the Redis rate-limit store
+#    docker compose -f docker-compose.proc.yml --profile redis up -d --no-build
+#
+#  Rollback
+#  --------
+#  `OMNIROUTE_IMAGE` is the only thing that selects a release. Set it back to the
+#  previous tag (recorded by scripts/ops/proc-deploy.sh in .proc-releases) and run
+#  `up -d --no-build` again. The data volume is untouched by a rollback.
+# ──────────────────────────────────────────────────────────────────────────────
+name: omniroute-proc
+
+services:
+  omniroute:
+    container_name: omniroute
+    # Immutable tag or digest — never `latest`. `:?` makes compose fail closed
+    # instead of silently starting whatever image happens to be cached.
+    image: ${OMNIROUTE_IMAGE:?OMNIROUTE_IMAGE must be set (e.g. ghcr.io/owner/omniroute:proc-abc123)}
+    restart: unless-stopped
+    stop_grace_period: 40s
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "20128"
+      DASHBOARD_PORT: "20128"
+      API_PORT: "20129"
+      API_HOST: 127.0.0.1
+      LIVE_WS_PORT: "20132"
+      LIVE_WS_HOST: 127.0.0.1
+      DATA_DIR: /app/data
+      # Headless proxy engine: no dashboard pages, no dashboard-only subsystems.
+      OMNIROUTE_HEADLESS: ${OMNIROUTE_HEADLESS:-1}
+      # Runtime V8 heap. The container limit below leaves room for the Next
+      # runtime + SQLite page cache on a 4 GB host; raise both together.
+      OMNIROUTE_MEMORY_MB: ${OMNIROUTE_MEMORY_MB:-768}
+    ports:
+      # Loopback only. Public traffic arrives through Nginx (see
+      # config/deploy/nginx-omniroute.conf), never straight from the internet.
+      - "127.0.0.1:${PROD_DASHBOARD_PORT:-20130}:20128"
+      - "127.0.0.1:${PROD_API_PORT:-20131}:20129"
+      - "127.0.0.1:${PROD_LIVE_WS_PORT:-20132}:20132"
+    volumes:
+      - data:/app/data
+    healthcheck:
+      # Node image (Dockerfile runner-base). A Bun image uses `bun healthcheck.mjs`.
+      test: ["CMD", "node", "healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # Hard ceiling so a runaway request can never take the whole 4 GB host down
+    # and OOM-kill the neighbouring services.
+    mem_limit: ${OMNIROUTE_MEM_LIMIT:-1280m}
+    mem_reservation: 256m
+    cpus: ${OMNIROUTE_CPU_LIMIT:-1.5}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # Opt-in rate-limit/quota store. Not required: the default driver is SQLite
+  # (QUOTA_STORE_DRIVER=sqlite). Enable with `--profile redis` only when the
+  # operator explicitly wants a shared store.
+  redis:
+    image: redis:8.6.5-alpine
+    container_name: omniroute-redis
+    restart: unless-stopped
+    profiles: ["redis"]
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 192m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+
+volumes:
+  data:
+    name: omniroute-prod-data
+  redis-data:
+    name: omniroute-redis-data

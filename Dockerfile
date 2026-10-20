@@ -179,6 +179,18 @@ ENV OMNIROUTE_BASE_PATH=$OMNIROUTE_BASE_PATH
 ARG DASHBOARD_ALLOW_EMBED=""
 ENV DASHBOARD_ALLOW_EMBED=$DASHBOARD_ALLOW_EMBED
 
+# Headless/API-only build profile for gateway hosts that cannot afford the
+# dashboard build (a 2 vCPU / 4 GB box OOMs the prerender pass). With
+# OMNIROUTE_BUILD_BACKEND_ONLY=1 the build stubs every App-Router UI file before
+# `next build` (scripts/build/backendOnlyPages.mjs), so the client vendor graph,
+# the 149-page prerender pass and the Server-Actions manifest are never
+# compiled. The artifact keeps the complete `/v1/*` + `/api/*` surface and
+# answers 404 on the dashboard pages — pair it with `OMNIROUTE_HEADLESS=1` at
+# runtime. Empty (default) = full build, unchanged.
+# See docs/ops/PROC_HEADLESS_DEPLOY.md.
+ARG OMNIROUTE_BUILD_BACKEND_ONLY=""
+ENV OMNIROUTE_BUILD_BACKEND_ONLY=$OMNIROUTE_BUILD_BACKEND_ONLY
+
 # Docker containers cannot run the MITM/Agent-Bridge stack (no host DNS/cert
 # access), so keep @/mitm/manager on the graceful stub (#3390). This flag is
 # Docker-only: npm/Electron/VPS builds must bundle the REAL manager (#6344).
