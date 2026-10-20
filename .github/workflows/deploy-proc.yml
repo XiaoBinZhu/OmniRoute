@@ -42,6 +42,10 @@ on:
         description: "Deploy the built core image to the gateway host"
         type: boolean
         default: false
+      build_bun:
+        description: "Also build the Bun-runtime headless core (:proc-bun-<sha>)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -132,6 +136,82 @@ jobs:
             echo "| image | \`${{ steps.meta.outputs.image }}\` |"
             echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
             echo "| profile | API only (dashboard UI stubbed) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 1b. Optional Bun-runtime headless core ────────────────────────────────
+  # Same backend-only artifact, but built and run on Bun (oven/bun:1.4.3-slim)
+  # instead of Node. Purpose: the 43 box is 2 vCPU / 3.7 GB, so the *runtime*
+  # footprint matters — Bun usually holds a smaller RSS than Node for the same
+  # proxy workload, and its SQLite path is the native `bun:sqlite` module.
+  #
+  # Why this is not the default: upstream tracks Bun as a best-effort
+  # compatibility target, not a supported runtime (AGENTS.md → Environment), and
+  # `bun run --quiet build` has a history of OOM-killing. It is therefore opt-in
+  # per run and never blocks the Node core image that the gateway actually
+  # deploys. The Node build stays the rollback path.
+  build-core-bun:
+    name: build headless core image (Bun runtime)
+    needs: build-core
+    if: github.event_name == 'workflow_dispatch' && inputs.build_bun
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve image tag
+        id: meta
+        env:
+          REPO: ${{ vars.IMAGE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          repo="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          echo "image=$repo:proc-bun-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (Bun runtime, API only)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.bun
+          target: runner-base
+          push: true
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_BACKEND_ONLY=1
+            OMNIROUTE_BUILD_MEMORY_MB=12288
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha,scope=bun-core
+          cache-to: type=gha,mode=max,scope=bun-core
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=omniroute-core-bun
+
+      - name: Summary
+        run: |
+          {
+            echo "### Headless core image (Bun runtime)"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| image | \`${{ steps.meta.outputs.image }}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| profile | API only (dashboard UI stubbed), oven/bun:1.4.3-slim |"
+            echo ""
+            echo "Deploy with \`OMNIROUTE_HEALTHCHECK='bun healthcheck.mjs'\` and"
+            echo "\`OMNIROUTE_IMAGE=<image above>\` — the compose stack is identical."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── 2. Optional full/dashboard image ──────────────────────────────────────

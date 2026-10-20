@@ -72,8 +72,13 @@ services:
     volumes:
       - data:/app/data
     healthcheck:
-      # Node image (Dockerfile runner-base). A Bun image uses `bun healthcheck.mjs`.
-      test: ["CMD", "node", "healthcheck.mjs"]
+      # The stack is runtime-agnostic: the Node image (Dockerfile runner-base) ships
+      # `node healthcheck.mjs`, the Bun image (Dockerfile.bun runner-base) ships
+      # `bun healthcheck.mjs`. `node` inside the Bun image is not the Bun runtime, so
+      # the probe must follow the image rather than this file. Override per deployment:
+      #   OMNIROUTE_HEALTHCHECK='bun healthcheck.mjs'   (Bun)
+      #   OMNIROUTE_HEALTHCHECK='node healthcheck.mjs'  (Node, default)
+      test: ["CMD-SHELL", "${OMNIROUTE_HEALTHCHECK:-node healthcheck.mjs}"]
       interval: 30s
       timeout: 5s
       retries: 3
