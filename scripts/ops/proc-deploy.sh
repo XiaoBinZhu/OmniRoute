@@ -90,7 +90,15 @@ log "compose config OK"
 
 if [ "$DRY_RUN" = "1" ]; then
   log "--dry-run: would pull $IMAGE, run 'up -d --no-build', then gate /healthz and /v1/models"
-  OMNIROUTE_IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" config
+  # SECURITY: never print `docker compose config` here. It resolves `env_file: .env`
+  # and echoes every secret in cleartext (JWT_SECRET, API_KEY_SECRET,
+  # INITIAL_PASSWORD, STORAGE_ENCRYPTION_KEY, MACHINE_ID_SALT). In CI that writes
+  # production credentials into the Actions log. `--quiet` still validates the file
+  # (exit code only), and the summary below is derived from the compose file text
+  # rather than from the interpolated config.
+  log "resolved image: $IMAGE"
+  grep -E '^[[:space:]]*-[[:space:]]*"127\.0\.0\.1:' "$COMPOSE_FILE" 2>/dev/null | sed 's/^[[:space:]]*/  port /' || true
+  log "secrets are NOT printed in dry-run (see the comment in this block)"
   exit 0
 fi
 
