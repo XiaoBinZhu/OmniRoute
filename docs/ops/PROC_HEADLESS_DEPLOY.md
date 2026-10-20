@@ -60,6 +60,59 @@ npm run build:backend     # OMNIROUTE_BUILD_BACKEND_ONLY=1 node scripts/build/bu
 npm run build             # full build (dashboard included)
 ```
 
+### 2.2 Runtime choice: Node is the default, Bun is a measured downgrade
+
+The gateway image is Node (`runner-base`). A Bun-runtime variant exists
+(`runner-bun`, `oven/bun:1.4.3-slim`) but **it is not the default, and it is not a
+memory win** — measured on the 2 vCPU / 3.7 GB gateway host with the same commit and
+the same `builder` artifact, idle and warm:
+
+| metric                  | Node `:proc-<sha>` | Bun `:proc-bun-<sha>`  |
+| ----------------------- | ------------------ | ---------------------- |
+| cgroup `memory.current` | **316.8 MiB**      | **413.6 MiB** (+30.6%) |
+| cgroup `memory.peak`    | 356.9 MiB          | 552.9 MiB              |
+| PID 1 `VmRSS`           | 57.8 MiB           | 25.5 MiB               |
+
+The main process looks smaller under Bun because JSC's heap and compiled-code cache
+live outside PID 1's RSS — but they are still charged to the cgroup, which is what a
+4 GB host runs out of. Two further constraints:
+
+- `bun run build` **cannot** produce this artifact (`module.createRequire failed
+parsing argument` → `Could not parse output from TypeScript's --showConfig`), which
+  is why `runner-bun` copies the **Node-built** standalone instead of building.
+- Upstream tracks Bun as a best-effort compatibility target, not a supported runtime.
+
+Use it only if you specifically need `bun:sqlite`/Bun semantics, and deploy it with:
+
+```bash
+OMNIROUTE_IMAGE=<repo>:proc-bun-<sha12>
+OMNIROUTE_HEALTHCHECK='bun healthcheck.mjs'
+```
+
+`docker-compose.proc.yml` reads the probe from `OMNIROUTE_HEALTHCHECK` for exactly this
+reason: `node` inside the Bun image is not the Bun runtime, so a hard-coded `node
+healthcheck.mjs` would report a healthy container as unhealthy and trip the auto-rollback.
+
+### 2.3 Model names: use a same-name combo, never a model alias
+
+When the platform sends bare model names (`u2-flash`) but the credentials live on a
+custom node (`openai-compatible-chat-ch8`), the obvious mapping — `PUT
+/api/settings/model-aliases {"u2-flash":"openai-compatible-chat-ch8/u2-flash"}` — **breaks
+inference**: the alias layer rewrites the already-prefixed id a second time and you get
+`404 The model ... does not exist` or `401 No active credentials for provider`.
+
+Create a **combo whose name is the platform model name** instead, pointing at the
+prefixed model. That resolves without touching the caller:
+
+```bash
+POST /api/combos
+{"name":"u2-flash","models":[{"model":"openai-compatible-chat-ch8/u2-flash"}],"strategy":"priority"}
+```
+
+Then sync each connection's catalogue so the node knows its models
+(`POST /api/providers/<connectionId>/sync-models` — note: the id is the **connection
+UUID**, not the provider id).
+
 ### 2.1 Headless runtime
 
 `OMNIROUTE_HEADLESS=1` (or `omniroute serve --headless`) is the runtime counterpart. It is
