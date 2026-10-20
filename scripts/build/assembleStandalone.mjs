@@ -392,6 +392,17 @@ export const EXTRA_MODULE_ENTRIES = [
     dest: ["webdav-handler.mjs"],
   },
   {
+    // `scripts/dev/opaqueImport.mjs` is a sibling shim re-exporting the real,
+    // self-contained implementation. Both are flattened to the bundle root, so
+    // webdav-handler's `./opaqueImport.mjs` keeps resolving after the copy.
+    // Without this the container died at boot with
+    // ERR_MODULE_NOT_FOUND: /bin/cli/runtime/opaqueImport.mjs (the old
+    // ../../bin/... import escaped the flattened bundle root).
+    label: "optional-native importer (webdav-handler.mjs dependency)",
+    src: ["bin", "cli", "runtime", "opaqueImport.mjs"],
+    dest: ["opaqueImport.mjs"],
+  },
+  {
     // #5242: opt-in HTTPS/TLS resolver (server-ws.mjs dependency).
     label: "tls-options (server-ws.mjs dependency)",
     src: ["scripts", "dev", "tls-options.mjs"],

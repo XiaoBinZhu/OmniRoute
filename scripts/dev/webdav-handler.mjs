@@ -24,7 +24,10 @@ import path from "node:path";
 import { createDecipheriv, scryptSync, createHash, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
 import os from "node:os";
-import { requireOptionalNative } from "../../bin/cli/runtime/opaqueImport.mjs";
+// Sibling shim, NOT ../../bin/...: assembleStandalone flattens this file to the
+// bundle root, where `../../bin` resolves to `/bin` and the container dies at
+// boot with ERR_MODULE_NOT_FOUND: /bin/cli/runtime/opaqueImport.mjs.
+import { requireOptionalNative } from "./opaqueImport.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants

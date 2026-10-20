@@ -81,6 +81,12 @@ export const APP_STAGING_ALLOWED_EXACT_PATHS: string[] = [
   // crashes with ERR_MODULE_NOT_FOUND (regressed in the published 3.8.41 tarball).
   "tls-options.mjs",
   "webdav-handler.mjs",
+  // webdav-handler.mjs imports ./opaqueImport.mjs (sibling shim in scripts/dev,
+  // shipped verbatim from bin/cli/runtime by assembleStandalone). Both the
+  // standalone bundle and the npm dist flatten webdav-handler to the root, so
+  // without this bare entry the prepublish prune deletes it and every boot dies
+  // with ERR_MODULE_NOT_FOUND: /bin/cli/runtime/opaqueImport.mjs.
+  "opaqueImport.mjs",
 ];
 
 export const APP_STAGING_ALLOWED_PATH_PREFIXES: string[] = [
@@ -241,6 +247,8 @@ export const PACK_ARTIFACT_REQUIRED_PATHS: string[] = [
   // Cleartext h2c upgrade guard (dist/server-ws.mjs import) — same boot-crash class as above.
   "dist/h2c-upgrade-guard.cjs",
   "dist/webdav-handler.mjs",
+  // Regression guard: dist/webdav-handler.mjs imports ./opaqueImport.mjs.
+  "dist/opaqueImport.mjs",
   "bin/cli/program.mjs",
   // Direct imports of bin/omniroute.mjs — bin/cli/ is only an allowlist PREFIX, so a
   // file vanishing from the tarball never fails the unexpected-paths check; only these
