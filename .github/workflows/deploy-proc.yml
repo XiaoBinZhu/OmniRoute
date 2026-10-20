@@ -183,8 +183,13 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.bun
-          target: runner-base
+          # NOT Dockerfile.bun: `bun run build` fails on this codebase
+          # ("module.createRequire failed parsing argument" → "Could not parse
+          # output from TypeScript's --showConfig"), which is why upstream marks
+          # Bun best-effort. `runner-bun` reuses the proven Node builder and only
+          # swaps the runtime, so the artifact is identical to the core image and
+          # the memory comparison has a single variable.
+          target: runner-bun
           push: true
           build-args: |
             OMNIROUTE_USE_TURBOPACK=0

@@ -327,6 +327,65 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 
 CMD ["node", "dev/run-standalone.mjs"]
 
+# ── Runner Bun (Node-built artifact, Bun runtime) ─────────────────────────────
+#
+# Why this stage exists. `bun run build` cannot produce this Next.js artifact:
+# it fails with "module.createRequire failed parsing argument" followed by
+# "Could not parse output from TypeScript's --showConfig", and upstream already
+# tracks Bun as a best-effort compatibility target rather than a supported
+# runtime (AGENTS.md → Environment). Building with Node and *running* on Bun
+# decouples the two: the 2 vCPU / 4 GB gateway host gets Bun's smaller runtime
+# RSS without inheriting Bun's broken build path.
+#
+# The artifact is the exact same `builder` output as runner-base, so when the two
+# images are compared for memory the only variable is the runtime itself.
+FROM oven/bun:1.4.3-slim AS runner-bun
+
+LABEL org.opencontainers.image.title="omniroute" \
+  org.opencontainers.image.description="Unified AI proxy — Bun runtime on a Node-built artifact" \
+  org.opencontainers.image.url="https://omniroute.online" \
+  org.opencontainers.image.source="https://github.com/diegosouzapw/OmniRoute" \
+  org.opencontainers.image.licenses="MIT"
+
+WORKDIR /app
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+     ca-certificates \
+     curl \
+     sqlite3 \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV NODE_ENV=production
+ENV PORT=20128
+ENV HOSTNAME=0.0.0.0
+ENV DATA_DIR=/app/data
+ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
+# Same shipped posture as runner-base (#13679): a bare `docker run -p` of the
+# published image must not expose a keyless proxy.
+ENV REQUIRE_API_KEY=true
+
+COPY --from=builder /app/.build/next/standalone ./
+COPY --from=builder /app/scripts/dev/healthcheck.mjs ./healthcheck.mjs
+
+# Bun uses bun:sqlite. Remove every Node-only copy of the addon so no traced
+# chunk can dlopen it and abort the process before the driver fallback runs.
+RUN find /app \
+      -path '*/node_modules/better-sqlite3' \
+      -prune \
+      -exec rm -rf '{}' + \
+  && mkdir -p /app/data \
+  && chown -R bun:bun /app
+
+USER bun
+
+EXPOSE 20128
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD bun healthcheck.mjs || exit 1
+
+ENTRYPOINT ["bun", "dev/run-standalone.mjs"]
+
 # ── Runner Web (web-cookie providers: Gemini Web, Claude Turnstile) ───────────
 #
 #  Two image flavors:
