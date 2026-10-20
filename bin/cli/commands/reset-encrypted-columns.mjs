@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { resolveDataDir } from "../data-dir.mjs";
 import { join } from "node:path";
+import { requireOptionalNative } from "../runtime/opaqueImport.mjs";
 
 const ENCRYPTED_PATTERN = "enc:v1:%";
 const ENCRYPTED_COLUMNS = ["api_key", "access_token", "refresh_token", "id_token"];
@@ -43,10 +44,12 @@ export async function runResetEncryptedColumns(argv) {
 
   let db;
   try {
-    // Use createRequire to load better-sqlite3 (works in both dev and production)
+    // Load better-sqlite3 through the runtime loader so the bundler does not
+    // try to resolve (and warn about) a package that is legitimately absent
+    // when its native build was skipped — see bin/cli/runtime/opaqueImport.mjs.
     const { createRequire } = await import("node:module");
     const require = createRequire(import.meta.url);
-    const Database = require("better-sqlite3");
+    const Database = requireOptionalNative(require, "better-sqlite3");
 
     db = new Database(dbPath);
 

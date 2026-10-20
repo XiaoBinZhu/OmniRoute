@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveDataDir } from "./data-dir.mjs";
 import { writePrivateFileAtomic } from "./private-file.mjs";
+import { importOptionalNative } from "./runtime/opaqueImport.mjs";
 
 const CONFIG_VERSION = 1;
 const KEYCHAIN_SERVICE = "omniroute-cli";
@@ -29,7 +30,10 @@ function isKeychainBackend(value) {
 async function loadKeychainBackend() {
   if (KEYCHAIN_DISABLED) return null;
   try {
-    const imported = await import("keytar");
+    // Loaded through the runtime so the bundler does not try to resolve (and
+    // warn about) a package that is legitimately absent when its native build
+    // was skipped — see bin/cli/runtime/opaqueImport.mjs.
+    const imported = await importOptionalNative("keytar");
     const candidate = isKeychainBackend(imported?.default) ? imported.default : imported;
     return isKeychainBackend(candidate) ? candidate : null;
   } catch {

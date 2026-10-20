@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { resolveDataDir, resolveStoragePath } from "./data-dir.mjs";
 import { ensureProviderSchema } from "./provider-store.mjs";
 import { ensureSettingsSchema, hashManagementPassword, updateSettings } from "./settings-store.mjs";
+import { importOptionalNative } from "./runtime/opaqueImport.mjs";
 
 async function loadSqlite() {
   if (process.versions.bun) {
@@ -12,7 +13,11 @@ async function loadSqlite() {
     }
   }
   try {
-    return { Database: (await import("better-sqlite3")).default, driver: "better-sqlite3" };
+    // Loaded through the runtime so the bundler does not try to resolve (and
+    // warn about) a package that is legitimately absent when its native build
+    // was skipped — see bin/cli/runtime/opaqueImport.mjs.
+    const imported = await importOptionalNative("better-sqlite3");
+    return { Database: imported.default ?? imported, driver: "better-sqlite3" };
   } catch (error) {
     return { error };
   }

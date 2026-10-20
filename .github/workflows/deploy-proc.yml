@@ -1,0 +1,261 @@
+name: deploy-proc
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Build the OmniRoute gateway image ONCE in CI, publish it to GHCR, and
+#  (optionally) deploy it to the 43 gateway host — which never builds anything.
+#
+#  Why: a Next.js production build for this repo needs ~9 GB RSS (2 processes ×
+#  ~4.5 GB). The 43 box has 2 vCPU / 3.7 GB RAM and is OOM-killed every time, so
+#  `docker compose build` there is not an option (incident 2026-10-20, see the
+#  MaaS phase-2 plan §65.7). The host only pulls an immutable tag.
+#
+#  Images produced from the same commit:
+#    <repo>:proc-<sha>       headless core — API only, dashboard stubbed
+#                            (OMNIROUTE_BUILD_BACKEND_ONLY=1), what the gateway runs
+#    <repo>:proc             moving alias of the same core image
+#    <repo>:proc-web-<sha>   full image with the dashboard — built only when
+#                            workflow_dispatch sets build_web=true
+#
+#  Deployment is gated twice: the repository variable DEPLOY_ENABLED must be
+#  'true', AND the run must either be a push to `proc` or a manual dispatch with
+#  deploy=true. With DEPLOY_ENABLED=false the workflow is build-and-publish only.
+#
+#  Required repository configuration (fork owner):
+#    variables: IMAGE_REPOSITORY (lowercase, e.g. ghcr.io/xiaobinzhu/omniroute),
+#               DEPLOY_ENABLED, DEPLOY_HOST, DEPLOY_PORT, DEPLOY_USER,
+#               DEPLOY_PATH, DEPLOY_COMPOSE_FILE, DEPLOY_SERVICE,
+#               DEPLOY_HEALTH_URL, DEPLOY_DASHBOARD_PORT, DEPLOY_API_PORT,
+#               DEPLOY_LIVE_WS_PORT, DEPLOY_KEEP_RELEASES, GHCR_USERNAME
+#    secrets:   DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS, GHCR_DEPLOY_TOKEN (read-only
+#               packages scope — used only on the server to pull)
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [proc]
+  workflow_dispatch:
+    inputs:
+      build_web:
+        description: "Also build the full dashboard image (:proc-web-<sha>)"
+        type: boolean
+        default: false
+      deploy:
+        description: "Deploy the built core image to the gateway host"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-proc-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Repository variable, already lowercase — GHCR rejects an uppercase path
+  # (the first run died on `ghcr.io/XiaoBinZhu/...`: "repository name must be
+  # lowercase"). Never build the tag from github.repository here.
+  IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+
+jobs:
+  # ── 1. Headless core image (what the gateway actually runs) ────────────────
+  build-core:
+    name: build headless core image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve image tags
+        id: meta
+        env:
+          REPO: ${{ vars.IMAGE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REPO:-}" ]; then
+            echo "::error::Repository variable IMAGE_REPOSITORY is not set (expected e.g. ghcr.io/<owner>/omniroute)"
+            exit 1
+          fi
+          repo="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          tag="proc-${GITHUB_SHA::12}"
+          {
+            echo "tag=$tag"
+            echo "image=$repo:$tag"
+            echo "alias=$repo:proc"
+            echo "repo=$repo"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (API only, no dashboard)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Node runner-base: the documented, CI-proven runtime; `bun healthcheck.mjs`
+          # in compose would be wrong for it — docker-compose.proc.yml uses `node`.
+          target: runner-base
+          push: true
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_BACKEND_ONLY=1
+            OMNIROUTE_BUILD_MEMORY_MB=12288
+            OMNIROUTE_BUILD_WORKERS=2
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.alias }}
+          cache-from: type=gha,scope=core
+          cache-to: type=gha,mode=max,scope=core
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=omniroute-core
+
+      - name: Summary
+        run: |
+          {
+            echo "### Headless core image"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| image | \`${{ steps.meta.outputs.image }}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| profile | API only (dashboard UI stubbed) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 2. Optional full/dashboard image ──────────────────────────────────────
+  build-web:
+    name: build full dashboard image
+    if: github.event_name == 'workflow_dispatch' && inputs.build_web
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve image tag
+        id: meta
+        env:
+          REPO: ${{ vars.IMAGE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          repo="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          echo "image=$repo:proc-web-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (dashboard included)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner-base
+          push: true
+          build-args: |
+            OMNIROUTE_USE_TURBOPACK=0
+            OMNIROUTE_BUILD_MEMORY_MB=12288
+            OMNIROUTE_BUILD_WORKERS=2
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha,scope=core
+          cache-to: type=gha,mode=max,scope=web
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=omniroute-web
+
+      - name: Summary
+        run: |
+          {
+            echo "### Full dashboard image"
+            echo ""
+            echo "- image: \`${{ steps.meta.outputs.image }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 3. Deploy (pull-only on the host; no build, health-gated, auto-rollback) ─
+  deploy:
+    name: deploy to gateway host
+    needs: build-core
+    if: >-
+      vars.DEPLOY_ENABLED == 'true' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Ship compose file + deploy script
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "${{ vars.DEPLOY_PORT }}" \
+            "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}" \
+            "mkdir -p '${{ vars.DEPLOY_PATH }}/scripts/ops'"
+          scp -i ~/.ssh/deploy_key -P "${{ vars.DEPLOY_PORT }}" \
+            "${{ vars.DEPLOY_COMPOSE_FILE }}" \
+            "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}:${{ vars.DEPLOY_PATH }}/"
+          scp -i ~/.ssh/deploy_key -P "${{ vars.DEPLOY_PORT }}" \
+            scripts/ops/proc-deploy.sh \
+            "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}:${{ vars.DEPLOY_PATH }}/scripts/ops/"
+
+      - name: Registry login on the host (read-only token, via stdin)
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.GHCR_DEPLOY_TOKEN }}" ]; then
+            printf '%s' "${{ secrets.GHCR_DEPLOY_TOKEN }}" | \
+              ssh -i ~/.ssh/deploy_key -p "${{ vars.DEPLOY_PORT }}" \
+                "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}" \
+                "docker login ghcr.io -u '${{ vars.GHCR_USERNAME }}' --password-stdin"
+          else
+            echo "::warning::GHCR_DEPLOY_TOKEN is empty — assuming the host already has registry credentials"
+          fi
+
+      - name: Deploy (pull, up --no-build, health gate, rollback)
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "${{ vars.DEPLOY_PORT }}" \
+            "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}" \
+            "cd '${{ vars.DEPLOY_PATH }}' && \
+             OMNIROUTE_COMPOSE_FILE='${{ vars.DEPLOY_COMPOSE_FILE }}' \
+             OMNIROUTE_SERVICE='${{ vars.DEPLOY_SERVICE }}' \
+             OMNIROUTE_HOST_PORT='${{ vars.DEPLOY_DASHBOARD_PORT }}' \
+             sh scripts/ops/proc-deploy.sh '${{ needs.build-core.outputs.image }}'"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy"
+            echo ""
+            echo "- image: \`${{ needs.build-core.outputs.image }}\`"
+            echo "- digest: \`${{ needs.build-core.outputs.digest }}\`"
+            echo "- host: \`${{ vars.DEPLOY_HOST }}\`"
+            echo "- result: ${{ job.status }}"
+            echo "- health: \`${{ vars.DEPLOY_HEALTH_URL }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

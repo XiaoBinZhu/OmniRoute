@@ -24,6 +24,7 @@ import path from "node:path";
 import { createDecipheriv, scryptSync, createHash, timingSafeEqual } from "node:crypto";
 import { createRequire } from "node:module";
 import os from "node:os";
+import { requireOptionalNative } from "../../bin/cli/runtime/opaqueImport.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -388,9 +389,11 @@ export function loadWebdavConfig() {
 
   let db;
   try {
-    // Use require() because better-sqlite3 is a CJS module
+    // Use require() because better-sqlite3 is a CJS module; the request is kept
+    // out of the bundler's static graph so an absent optional dependency does
+    // not surface as a "Module not found" warning per compiled route.
     const _require = createRequire(import.meta.url);
-    const Database = _require("better-sqlite3");
+    const Database = requireOptionalNative(_require, "better-sqlite3");
     db = new Database(sqlitePath, { readonly: true, fileMustExist: true });
   } catch {
     return null;
@@ -494,8 +497,7 @@ function buildEntryHref(baseHref, relativePath, isDir) {
 function handleOptions(req, res) {
   res.writeHead(200, {
     DAV: "1, 2",
-    Allow:
-      "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, PROPFIND, LOCK, UNLOCK",
+    Allow: "OPTIONS, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, PROPFIND, LOCK, UNLOCK",
     "MS-Author-Via": "DAV",
     "Content-Length": "0",
   });
