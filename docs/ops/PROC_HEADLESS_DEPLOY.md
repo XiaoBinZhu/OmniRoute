@@ -226,6 +226,28 @@ A Windows workstation has no Docker/WSL in this environment, so the CI path is t
 there — the image contains Linux native modules (`better-sqlite3`, `sqlite-vec`) and cannot be
 produced on Windows anyway.
 
+### 4.3 Verified run (2026-10-21, `b0316b682f`)
+
+The full "backend → frontend → deploy" chain was exercised end to end on the 43 box
+(2 vCPU / 3.7 GB, the host that cannot build):
+
+| step                                             | observed                                                               |
+| ------------------------------------------------ | ---------------------------------------------------------------------- |
+| `build-core`                                     | success (~11 min, `:proc-b0316b682fcd`)                                |
+| `build-web` (`needs: build-core`)                | success (`:proc-web-b0316b682fcd`)                                     |
+| `deploy` (`needs: [build-core, build-web]`)      | success                                                                |
+| host after deploy                                | `Up (healthy)`, `restarts=0`, `OOMKilled=false`                        |
+| `/healthz`, `/v1/models`, `/dashboard`, `/login` | 200, 401, 307, 200 (219,390 bytes)                                     |
+| container `OMNIROUTE_HEADLESS`                   | `0` (dashboard serving)                                                |
+| host `.env`                                      | `OMNIROUTE_IMAGE/HEALTHCHECK/HEADLESS/MEM_LIMIT/MEMORY_MB` persisted   |
+| bare `docker compose config` (no shell env)      | resolves to the deployed image, `HEADLESS="0"`, `node healthcheck.mjs` |
+| memory                                           | 384.8 MiB / 1.25 GiB (30%); host `available` 2221 MB                   |
+| old gateway                                      | `ai-gateway-1/2` untouched, still healthy                              |
+
+The `.env` write-back is what makes the last row reproducible: before it, a plain
+`docker compose up -d` would have re-resolved `OMNIROUTE_HEADLESS` to the compose default `1`
+and silently turned the dashboard image back into a headless one.
+
 ## 5. Verifying a deployment
 
 ```bash
