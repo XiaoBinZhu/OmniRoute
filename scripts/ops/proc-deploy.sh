@@ -25,6 +25,11 @@
 #    OMNIROUTE_SERVICE            compose service name (default omniroute)
 #    OMNIROUTE_HEALTH_TIMEOUT     seconds to wait for /healthz (default 180)
 #    OMNIROUTE_API_KEY            bearer token for the /v1/models gate (optional)
+#    OMNIROUTE_HEALTHCHECK        container healthcheck command; auto-detected from
+#                                 the image runtime when unset (node vs bun)
+#    OMNIROUTE_MEM_LIMIT          container memory ceiling (default: compose value)
+#    OMNIROUTE_MEMORY_MB          runtime V8 heap (default: compose value)
+#    OMNIROUTE_HEADLESS           "1" (default) gates dashboard routes closed
 #
 #  Exit codes: 0 success · 1 usage/config error · 2 pull failed · 3 health gate
 #  failed after deploy (rollback attempted) · 4 rollback failed (manual action).
@@ -41,7 +46,7 @@ DRY_RUN=0
 IMAGE=""
 
 usage() {
-  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
 }
 
@@ -116,9 +121,84 @@ fi
 TARGET_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
 log "pulled image id: $TARGET_ID"
 
+# ── 1b. Detect the runtime + healthcheck command ─────────────────────────────
+# The Node image (`runner-base`) ships `node healthcheck.mjs`; the Bun image
+# (`runner-bun`) ships `bun healthcheck.mjs` and `node` inside it is NOT the Bun
+# runtime. A hard-coded `node healthcheck.mjs` would mark a healthy Bun container
+# unhealthy and trip the auto-rollback, so the probe follows the image.
+#
+# `node` and `bun` may both exist in a stage; what identifies the intended
+# runtime is the PID 1 binary the image declares (Entrypoint/Cmd), with the
+# presence of the runtime as a fallback.
+detect_healthcheck() {
+  # $1 = image ref to inspect (defaults to the target image)
+  ref="${1:-$IMAGE}"
+  if [ -n "${OMNIROUTE_HEALTHCHECK:-}" ]; then
+    printf '%s' "$OMNIROUTE_HEALTHCHECK"
+    return 0
+  fi
+  runtime="$(docker image inspect "$ref" \
+    --format '{{join .Config.Entrypoint " "}} {{join .Config.Cmd " "}}' 2>/dev/null || true)"
+  case "$runtime" in
+    *bun*) printf 'bun healthcheck.mjs' ;;
+    *node*) printf 'node healthcheck.mjs' ;;
+    *)
+      if docker run --rm --entrypoint sh "$ref" -c 'command -v bun >/dev/null 2>&1'; then
+        printf 'bun healthcheck.mjs'
+      else
+        printf 'node healthcheck.mjs'
+      fi
+      ;;
+  esac
+}
+
+HEALTHCHECK_CMD="$(detect_healthcheck "$IMAGE")"
+case "$HEALTHCHECK_CMD" in
+  "bun healthcheck.mjs"|"node healthcheck.mjs") ;;
+  *)
+    echo "error: refusing an unrecognised healthcheck command: $HEALTHCHECK_CMD" >&2
+    echo "       expected 'node healthcheck.mjs' or 'bun healthcheck.mjs'" >&2
+    exit 1
+    ;;
+esac
+log "container healthcheck: $HEALTHCHECK_CMD"
+
+# ── 1c. Persist the deployment knobs in the host .env ────────────────────────
+# docker compose interpolates `${VAR:-default}` from the shell environment and
+# from the project `.env`, but env_file values never participate in
+# interpolation. The host `.env` therefore has to carry the deployment knobs
+# (image, healthcheck, headless, memory ceilings) for `docker compose ps|up` run
+# by hand later to resolve the same stack CI deployed. Only non-secret values are
+# written; nothing here is ever echoed with a value.
+persist_env() {
+  key="$1"
+  value="$2"
+  [ -n "$value" ] || return 0
+  touch .env
+  if grep -q "^${key}=" .env; then
+    # Rewrite in place without printing the old/new value.
+    tmp="$(mktemp)"
+    awk -v k="$key" -v v="$value" 'BEGIN{FS=OFS="="} $1==k{print k"="v; next} {print}' .env > "$tmp"
+    cat "$tmp" > .env
+    rm -f "$tmp"
+  else
+    printf '%s=%s\n' "$key" "$value" >> .env
+  fi
+}
+
+persist_env OMNIROUTE_IMAGE "$IMAGE"
+persist_env OMNIROUTE_HEALTHCHECK "$HEALTHCHECK_CMD"
+if [ -n "${OMNIROUTE_HEADLESS:-}" ]; then persist_env OMNIROUTE_HEADLESS "$OMNIROUTE_HEADLESS"; fi
+if [ -n "${OMNIROUTE_MEMORY_MB:-}" ]; then persist_env OMNIROUTE_MEMORY_MB "$OMNIROUTE_MEMORY_MB"; fi
+if [ -n "${OMNIROUTE_MEM_LIMIT:-}" ]; then persist_env OMNIROUTE_MEM_LIMIT "$OMNIROUTE_MEM_LIMIT"; fi
+log "host .env updated (image/healthcheck/headless/memory keys only)"
+
 # ── 2. Recreate without building ─────────────────────────────────────────────
-OMNIROUTE_IMAGE="$IMAGE" docker compose -f "$COMPOSE_FILE" up -d --no-build --remove-orphans
-log "stack recreated"
+OMNIROUTE_IMAGE="$IMAGE" \
+OMNIROUTE_HEALTHCHECK="$HEALTHCHECK_CMD" \
+OMNIROUTE_HEADLESS="${OMNIROUTE_HEADLESS:-1}" \
+  docker compose -f "$COMPOSE_FILE" up -d --no-build --remove-orphans
+log "stack recreated (headless=${OMNIROUTE_HEADLESS:-1})"
 
 # ── 3. Health gate ───────────────────────────────────────────────────────────
 wait_health() {
@@ -149,6 +229,16 @@ wait_health() {
   return 1
 }
 
+# Recreate with an explicit image ref. The compose healthcheck reads
+# OMNIROUTE_HEALTHCHECK, so the rollback must set it too — otherwise rolling back
+# a Bun release to a Node release (or the reverse) keeps the wrong probe.
+recreate_with() {
+  OMNIROUTE_IMAGE="$1" \
+  OMNIROUTE_HEALTHCHECK="$HEALTHCHECK_CMD" \
+  OMNIROUTE_HEADLESS="${OMNIROUTE_HEADLESS:-1}" \
+    docker compose -f "$COMPOSE_FILE" up -d --no-build --remove-orphans
+}
+
 if wait_health; then
   log "health gate passed (healthz + /v1/models)"
 else
@@ -158,8 +248,17 @@ else
     echo "error: no previous image recorded; manual action required" >&2
     exit 4
   fi
-  OMNIROUTE_IMAGE="${PREVIOUS_IMAGE:-$PREVIOUS_ID}" \
+  PREVIOUS_REF="${PREVIOUS_IMAGE:-$PREVIOUS_ID}"
+  # The rollback target may be a different runtime than the failed release, so
+  # re-detect its probe instead of reusing the new image's. An explicit
+  # OMNIROUTE_HEALTHCHECK override still wins (detect_healthcheck honours it).
+  ROLLBACK_HEALTHCHECK="$(detect_healthcheck "$PREVIOUS_REF")"
+  OMNIROUTE_HEALTHCHECK="$ROLLBACK_HEALTHCHECK" \
+    OMNIROUTE_IMAGE="$PREVIOUS_REF" \
+    OMNIROUTE_HEADLESS="${OMNIROUTE_HEADLESS:-1}" \
     docker compose -f "$COMPOSE_FILE" up -d --no-build --remove-orphans || exit 4
+  persist_env OMNIROUTE_IMAGE "$PREVIOUS_REF"
+  persist_env OMNIROUTE_HEALTHCHECK "$ROLLBACK_HEALTHCHECK"
   if wait_health; then
     log "rollback healthy — deployment aborted, previous release restored"
     exit 3

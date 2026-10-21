@@ -154,10 +154,12 @@ trees) — tracked as a separate change, not a deployment prerequisite.
 
 Push to `proc`, or run **Actions → deploy-proc → Run workflow**:
 
-| input       | effect                                                                                |
-| ----------- | ------------------------------------------------------------------------------------- |
-| `build_web` | also build `:proc-web-<sha>` (full dashboard image)                                   |
-| `deploy`    | deploy the freshly built core image (only when `DEPLOY_ENABLED=true` on a manual run) |
+| input          | effect                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------- |
+| `build_web`    | also build `:proc-web-<sha>` (full dashboard image)                                         |
+| `deploy`       | deploy the freshly built image (only when `DEPLOY_ENABLED=true` on a manual run)            |
+| `deploy_image` | `core` (headless API) or `web` (dashboard). `web` requires `build_web=true` in the same run |
+| `build_bun`    | also build `:proc-bun-<sha>` (Bun runtime, same Node-built artifact)                        |
 
 The build job publishes:
 
@@ -165,19 +167,36 @@ The build job publishes:
 <IMAGE_REPOSITORY>:proc-<sha12>     # immutable — deploy this
 <IMAGE_REPOSITORY>:proc             # moving alias of the same digest
 <IMAGE_REPOSITORY>:proc-web-<sha12> # only with build_web=true
+<IMAGE_REPOSITORY>:proc-bun-<sha12> # only with build_bun=true
 ```
 
 `IMAGE_REPOSITORY` must be **lowercase** (for example `ghcr.io/xiaobinzhu/omniroute`). GHCR
 rejects uppercase repository names — the first attempt failed with
 `invalid tag "ghcr.io/XiaoBinZhu/omniroute:proc-…": repository name must be lowercase`.
 
+**"Backend first, then frontend, then deploy" as a push pipeline.** With the repository variable
+`DEPLOY_IMAGE_KIND=web`, a push to `proc` builds the headless core first, then the dashboard
+image (`build-web`), and only then deploys the **dashboard** image with `OMNIROUTE_HEADLESS=0`.
+`build-core` → `build-web` → `deploy` is expressed as job `needs`, so the order is enforced by the
+runner and a failed dashboard build leaves the previous release untouched. Leave
+`DEPLOY_IMAGE_KIND` unset (or `core`) to keep the headless API image as the deployed one; on a
+manual dispatch the `deploy_image` input takes precedence.
+
 The deploy job:
 
 1. copies `docker-compose.proc.yml` and `scripts/ops/proc-deploy.sh` to `DEPLOY_PATH`;
 2. logs the host in to GHCR with the read-only `GHCR_DEPLOY_TOKEN` (sent over SSH stdin, never on
    a command line);
-3. runs `proc-deploy.sh <image>`, which pulls, recreates with `--no-build`, waits for
-   `/healthz` **and** `/v1/models`, records the release and rolls back on failure.
+3. resolves the image (`core` or `web`) and its `OMNIROUTE_HEADLESS` value (`1`/`0`);
+4. runs `proc-deploy.sh <image>`, which pulls, recreates with `--no-build`, waits for `/healthz`
+   **and** `/v1/models`, records the release and rolls back on failure.
+
+The deploy script derives the container healthcheck from the image runtime (`node healthcheck.mjs`
+for `runner-base`, `bun healthcheck.mjs` for `runner-bun`) unless `OMNIROUTE_HEALTHCHECK` is set,
+and writes the non-secret deployment knobs (`OMNIROUTE_IMAGE`, `OMNIROUTE_HEALTHCHECK`,
+`OMNIROUTE_HEADLESS`, the memory ceilings) into the host `.env`. Without that, a later manual
+`docker compose up` would fall back to the compose defaults (`HEADLESS=1`, Node probe) and
+silently turn the dashboard image back into a headless one.
 
 ### 4.2 From a workstation with Docker (air-gapped hosts)
 
