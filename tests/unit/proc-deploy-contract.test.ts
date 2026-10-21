@@ -292,6 +292,24 @@ describe("deploy-proc.yml contract", () => {
     );
   });
 
+  it("uses only GitHub-expression operators (no ternary)", () => {
+    // `cond ? a : b` is NOT valid GitHub Actions expression syntax: the workflow
+    // file fails to parse and the run dies before any job starts (run
+    // 39534070209 — "This run likely failed because of a workflow file issue").
+    // Guard every `${{ … }}` interpolation and every job-level `if:` block.
+    const expressions = [...yaml.matchAll(/\$\{\{([\s\S]*?)\}\}/g)].map((m) => m[1]);
+    const ifBlocks = [...yaml.matchAll(/^\s{4}if:[\s\S]*?(?=^\s{4}[a-z-]+:)/gm)].map((m) => m[0]);
+    assert.ok(expressions.length > 0, "expected at least one expression interpolation");
+    assert.ok(ifBlocks.length > 0, "expected at least one job-level if block");
+    for (const expr of [...expressions, ...ifBlocks]) {
+      assert.doesNotMatch(
+        expr,
+        /\?[^?]*:/,
+        `ternary is not valid GitHub expression syntax: ${expr.trim()}`
+      );
+    }
+  });
+
   it("stays valid YAML with the expected jobs", async () => {
     const YAML = await import("js-yaml");
     const doc = YAML.load(yaml) as {

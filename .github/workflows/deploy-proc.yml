@@ -303,19 +303,24 @@ jobs:
     name: deploy to gateway host
     # Both image jobs are listed so the deploy can ship whichever one was built.
     # `needs` on a job whose `if` evaluated false makes this job skip too, which
-    # is why the condition below spells out the core case explicitly: with
+    # is why the condition spells out the core case explicitly: with
     # deploy_image=core the web job is skipped, and `always()` keeps this job
     # eligible while the explicit `needs.build-core.result` check keeps it honest.
     needs: [build-core, build-web]
+    # NOTE: GitHub Actions expressions have NO ternary operator — `cond ? a : b`
+    # is a workflow-file parse error and the run dies before any job starts
+    # (run 39534070209). Everything below uses `&&` / `||` only.
     if: >-
       always() &&
       vars.DEPLOY_ENABLED == 'true' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy)) &&
       (
         (needs.build-core.result == 'success' &&
-          (github.event_name == 'push' ? vars.DEPLOY_IMAGE_KIND != 'web' : inputs.deploy_image == 'core')) ||
+          ((github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND != 'web') ||
+           (github.event_name == 'workflow_dispatch' && inputs.deploy_image == 'core'))) ||
         (needs.build-web.result == 'success' &&
-          (github.event_name == 'push' ? vars.DEPLOY_IMAGE_KIND == 'web' : inputs.deploy_image == 'web'))
+          ((github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND == 'web') ||
+           (github.event_name == 'workflow_dispatch' && inputs.deploy_image == 'web')))
       )
     runs-on: ubuntu-latest
     timeout-minutes: 20
