@@ -52,6 +52,80 @@ function isLoopbackPeer(addr: string | undefined): boolean {
   return ip.startsWith("127.");
 }
 
+/**
+ * Trusted reverse-proxy CIDRs, from `OMNIROUTE_TRUSTED_PROXY_CIDRS`
+ * (comma-separated IPv4 CIDRs, e.g. `172.19.0.0/16,10.1.0.5/32`).
+ *
+ * Empty by default → only loopback peers are trusted, exactly as before, so
+ * enabling this never loosens an existing deployment by accident.
+ *
+ * Why it exists: a containerised deployment often reaches the app through a
+ * reverse proxy that runs in another network namespace, so the TCP peer is the
+ * Docker bridge gateway (`172.19.0.1`) rather than `127.0.0.1`. That peer is
+ * not loopback, so the forwarding headers were ignored and EVERY public client
+ * collapsed onto the same address — which turned the per-IP login lockout into
+ * a single global bucket: five failed logins from anyone locked the whole
+ * dashboard for everyone, and a trivial denial of service. Listing the proxy
+ * address here restores per-client buckets.
+ */
+function trustedProxyCidrs(): string[] {
+  return (process.env.OMNIROUTE_TRUSTED_PROXY_CIDRS ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+/** IPv4 dotted-quad → 32-bit unsigned integer; null when not a valid IPv4. */
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let value = 0;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet > 255) return null;
+    value = value * 256 + octet;
+  }
+  return value;
+}
+
+/**
+ * Whether `ip` falls inside `cidr`. Invalid CIDRs return false (fail-closed:
+ * a typo must never widen which peers are trusted). A bare IP is treated as /32.
+ */
+function ipv4InCidr(ip: string, cidr: string): boolean {
+  const [base, bitsRaw] = cidr.split("/");
+  // Number("") === 0 would silently turn a trailing-slash typo ("10.0.0.0/")
+  // into /0 — i.e. "trust every peer". Treat an empty prefix as invalid.
+  if (bitsRaw !== undefined && bitsRaw.trim() === "") return false;
+  const bits = bitsRaw === undefined ? 32 : Number(bitsRaw);
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  const addr = ipv4ToInt(ip);
+  const network = ipv4ToInt(base ?? "");
+  if (addr === null || network === null) return false;
+  if (bits === 0) return true;
+  const mask = bits === 32 ? 0xffffffff : (0xffffffff << (32 - bits)) >>> 0;
+  return (addr & mask) === (network & mask);
+}
+
+/**
+ * Whether the TCP peer is a reverse proxy we may trust for forwarding headers:
+ * loopback, or an address listed in `OMNIROUTE_TRUSTED_PROXY_CIDRS`.
+ *
+ * Only then is it safe to trust `X-Forwarded-For` — from a direct public socket
+ * those headers are attacker-controlled, and believing them would let a caller
+ * pick its own rate-limit bucket.
+ */
+function isTrustedProxy(addr: string | undefined): boolean {
+  const ip = normalizePeer(addr);
+  if (!ip) return false;
+  if (isLoopbackPeer(ip)) return true;
+  // Only IPv4 CIDRs are supported; an IPv6 peer (other than ::1, handled above)
+  // is not treated as a trusted proxy.
+  if (isIP(ip) !== 4) return false;
+  return trustedProxyCidrs().some((cidr) => ipv4InCidr(ip, cidr));
+}
+
 export type IpScope = "loopback" | "private" | "public" | "unknown";
 
 /**
@@ -132,7 +206,10 @@ export function getClientIpFromRequest(req: {
 
   const remoteAddress = req.ip ?? req.socket?.remoteAddress;
   const hasPeer = Boolean(normalizePeer(remoteAddress));
-  const trustForwardingHeaders = !hasPeer || isLoopbackPeer(remoteAddress);
+  // Loopback proxies (nginx on the host) and explicitly configured proxies
+  // (OMNIROUTE_TRUSTED_PROXY_CIDRS — e.g. a Docker bridge gateway) are trusted;
+  // a direct public peer is not.
+  const trustForwardingHeaders = !hasPeer || isTrustedProxy(remoteAddress);
 
   if (trustForwardingHeaders) {
     const cfIp = getHeader("cf-connecting-ip");
