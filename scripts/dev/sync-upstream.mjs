@@ -20,6 +20,11 @@
  * Usage (from the repository root):
  *     node scripts/dev/sync-upstream.mjs
  *     node scripts/dev/sync-upstream.mjs --dry-run    report only, write nothing
+ *     node scripts/dev/sync-upstream.mjs --branch release/vX.Y.Z   pin the upstream branch
+ *
+ * The upstream branch defaults to the highest `release/vX.Y.Z` on the upstream
+ * remote (upstream's active development branch), detected on every run.
+ * SYNC_UPSTREAM_BRANCH=<name> is equivalent to --branch.
  *
  * Safety rules this script honours:
  *   - `main` is only ever pushed with --force-with-lease, and only AFTER a fresh
@@ -33,10 +38,12 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 
 const UPSTREAM = "origin";
-const UPSTREAM_BRANCH = "release/v3.8.52";
 const FORK = "fork";
 
-const dryRun = process.argv.includes("--dry-run");
+const argv = process.argv.slice(2);
+const dryRun = argv.includes("--dry-run");
+const branchFlag = argv.indexOf("--branch");
+const branchOverride = branchFlag >= 0 ? argv[branchFlag + 1] : process.env.SYNC_UPSTREAM_BRANCH;
 
 const c = {
   cyan: (s) => `\x1b[36m${s}\x1b[0m`,
@@ -77,6 +84,19 @@ function moveMainTo(sha) {
 
 const short = (s) => String(s ?? "absent").slice(0, 10);
 
+/** Highest upstream `release/vX.Y.Z` by numeric version (upstream's active branch). */
+function detectUpstreamBranch() {
+  const out = git(["ls-remote", "--heads", UPSTREAM, "refs/heads/release/v*"]);
+  const versions = [];
+  for (const line of out.split(/\r?\n/)) {
+    const m = line.match(/refs\/heads\/(release\/v(\d+)\.(\d+)\.(\d+))$/);
+    if (m) versions.push({ name: m[1], v: [Number(m[2]), Number(m[3]), Number(m[4])] });
+  }
+  if (versions.length === 0) die(`No release/vX.Y.Z branch found on '${UPSTREAM}'.`);
+  versions.sort((a, b) => b.v[0] - a.v[0] || b.v[1] - a.v[1] || b.v[2] - a.v[2]);
+  return versions[0].name;
+}
+
 // --- 0. environment ----------------------------------------------------------
 if (!existsSync(".git")) die("Not a git repository root. Run this from the repo root.");
 
@@ -88,8 +108,12 @@ for (const r of [UPSTREAM, FORK]) {
 }
 
 const startBranch = git(["rev-parse", "--abbrev-ref", "HEAD"]);
-info(`repo:   ${process.cwd()}`);
-info(`branch: ${startBranch}`);
+const UPSTREAM_BRANCH = branchOverride || detectUpstreamBranch();
+info(`repo:     ${process.cwd()}`);
+info(`branch:   ${startBranch}`);
+info(
+  `upstream: ${UPSTREAM}/${UPSTREAM_BRANCH}${branchOverride ? " (override)" : " (auto-detected)"}`
+);
 
 // --- 1. clean working tree ---------------------------------------------------
 step("1/6 check working tree");
@@ -143,7 +167,7 @@ if (dryRun) {
     ok("fork/main already equals the upstream tip, nothing to push");
   } else {
     try {
-      git(["push", `--force-with-lease=${FORK}/main:${forkMainBefore}`, FORK, "main"], {
+      git(["push", `--force-with-lease=main:${forkMainBefore}`, FORK, "main"], {
         inherit: true,
       });
     } catch {
