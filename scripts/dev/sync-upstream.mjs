@@ -167,7 +167,7 @@ if (dryRun) {
     ok("fork/main already equals the upstream tip, nothing to push");
   } else {
     try {
-      git(["push", `--force-with-lease=${FORK}/main:${forkMainBefore}`, FORK, "main"], {
+      git(["push", `--force-with-lease=main:${forkMainBefore}`, FORK, "main"], {
         inherit: true,
       });
     } catch {
