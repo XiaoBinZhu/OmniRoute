@@ -24,6 +24,11 @@ import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
 import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
 import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
+import {
+  isNestBillingChatPath,
+  isNestBillingEnabled,
+  isNestBillingKeyCandidate,
+} from "@/lib/nestBilling/config";
 
 /**
  * Authenticate a client-API request at the route level.
@@ -38,6 +43,15 @@ export async function enforceClientApiRouteAuth(request: Request): Promise<Respo
   const { apiKey: apiKeyRaw, valid } = await resolveClientApiKey(request);
 
   if (valid) return null;
+  // Nest tokens are validated by the chat route preflight (D3); other routes
+  // still reject them because only the chat completions path is deferred.
+  if (
+    isNestBillingEnabled() &&
+    isNestBillingChatPath(request.url) &&
+    isNestBillingKeyCandidate(apiKeyRaw)
+  ) {
+    return null;
+  }
   if (apiKeyRaw) {
     return isRequireApiKeyEnabled()
       ? errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key")

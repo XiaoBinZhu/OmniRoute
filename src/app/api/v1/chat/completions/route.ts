@@ -1,6 +1,6 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { callCloudWithMachineId } from "@/shared/utils/cloud";
 import { handleChat } from "@/sse/handlers/chat";
 import { logAdmissionRejection } from "@/sse/handlers/admissionRejectionLog";
 import { generateRequestId } from "@/shared/utils/requestId";
@@ -45,6 +45,16 @@ import {
   isCommonChatGptWebRetirementError,
 } from "@/shared/constants/chatgptWebRetirement";
 import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
+import { extractApiKeyCandidates, resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
+import {
+  isNestBillingEnabled,
+  isNestBillingKeyCandidate,
+  nestBillingErrorResponse,
+  nestPreflight,
+  nestSettle,
+  withNestBilling,
+  type NestBillingContext,
+} from "@/lib/nestBilling";
 
 let initPromise = null;
 
@@ -100,6 +110,9 @@ export async function OPTIONS() {
 
 export async function POST(request) {
   await ensureInitialized();
+
+  let nestCtx: NestBillingContext | null = null;
+  let requestedModel = "";
 
   // Defense-in-depth: the authz proxy (src/proxy.ts) is the primary gate, but
   // its matcher can miss path variants (e.g. uppercase /V1/ aliases), so the
@@ -254,6 +267,7 @@ export async function POST(request) {
         // Preserve the caller-supplied provider identity long enough to enforce
         // retirement. A persisted alias can otherwise rewrite felo-web/... to a
         // healthy provider before getModelInfo or the executor tombstones see it.
+        requestedModel = typeof parsedBody?.model === "string" ? parsedBody.model : "";
         try {
           assertRuntimeModelProviderAvailable(parsedBody.model);
         } catch (error) {
@@ -294,6 +308,37 @@ export async function POST(request) {
       }
     } catch (error) {
       console.error("[SECURITY] Prompt injection guard failed:", error);
+    }
+
+    // D2/D3: nest preflight for `sk-` tokens (43 direct path). OmniRoute keys win
+    // when they validate, so local keys keep their existing behaviour.
+    if (isNestBillingEnabled() && parsedBodyIsRecord && requestedModel) {
+      const credential = extractApiKeyCandidates(request).find(isNestBillingKeyCandidate) ?? null;
+      if (credential) {
+        const localKey = await resolveClientApiKey(request).catch(() => ({ valid: false }));
+        if (!localKey.valid) {
+          const bodyText = JSON.stringify(parsedBody);
+          const preflight = await nestPreflight({
+            key: credential,
+            model: requestedModel,
+            stream: parsedBody.stream === true,
+            maxTokens: Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 1) || 1,
+            promptTokens: Math.max(1, Math.ceil(bodyText.length / 4)),
+            bodyDigest: createHash("sha256").update(bodyText).digest("hex"),
+            idempotencyKey: request.headers.get("x-idempotency-key"),
+          });
+          if (!preflight.ok) {
+            return finishAdmission(nestBillingErrorResponse(preflight));
+          }
+          nestCtx = {
+            ticket: preflight.ticket,
+            startedAt: Date.now(),
+            model: requestedModel,
+            promptTokensEstimate: Math.max(1, Math.ceil(bodyText.length / 4)),
+            signal: request.signal,
+          };
+        }
+      }
     }
 
     // Gate the early SSE keepalive wrapper: only wrap when the client explicitly
@@ -339,16 +384,32 @@ export async function POST(request) {
         extraHeaders: { "X-Correlation-Id": reqId },
         deadlineController: routeDeadlineController,
       });
-      return withCompressionHeaderEcho(streamedResponse, compressionRequestHeader);
+      return withCompressionHeaderEcho(
+        withNestBilling(streamedResponse, nestCtx),
+        compressionRequestHeader
+      );
     }
 
     return finishAdmission(
       withCompressionHeaderEcho(
-        await handleChat(request, null, parsedBody, callerCorrelationId ?? undefined),
+        withNestBilling(
+          await handleChat(request, null, parsedBody, callerCorrelationId ?? undefined),
+          nestCtx
+        ),
         compressionRequestHeader
       )
     );
   } catch (error) {
+    if (nestCtx) {
+      void nestSettle({
+        ticket: nestCtx.ticket,
+        status: 500,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        durationMs: Date.now() - nestCtx.startedAt,
+        error: (error as Error)?.message ?? String(error),
+        upstreamModel: nestCtx.model,
+      });
+    }
     admission.lease?.release();
     throw error;
   }

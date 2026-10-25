@@ -38,6 +38,13 @@ on:
         description: "Also build the full dashboard image (:proc-web-<sha>)"
         type: boolean
         default: false
+      image_variant:
+        description: "Image to deploy: core (API only) or web (dashboard included)"
+        type: choice
+        options:
+          - core
+          - web
+        default: core
       deploy:
         description: "Deploy the built core image to the gateway host"
         type: boolean
@@ -192,8 +199,9 @@ jobs:
   # ── 3. Deploy (pull-only on the host; no build, health-gated, auto-rollback) ─
   deploy:
     name: deploy to gateway host
-    needs: build-core
+    needs: [build-core, build-web]
     if: >-
+      always() &&
       vars.DEPLOY_ENABLED == 'true' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
     runs-on: ubuntu-latest
@@ -201,6 +209,31 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v5
+
+      - name: Resolve image variant
+        id: image
+        env:
+          VARIANT: ${{ inputs.image_variant || 'core' }}
+          CORE_IMAGE: ${{ needs.build-core.outputs.image }}
+          CORE_DIGEST: ${{ needs.build-core.outputs.digest }}
+          WEB_IMAGE: ${{ needs.build-web.outputs.image }}
+          WEB_DIGEST: ${{ needs.build-web.outputs.digest }}
+          WEB_RESULT: ${{ needs.build-web.result }}
+        run: |
+          set -euo pipefail
+          variant="${VARIANT:-core}"
+          if [ "$variant" = "web" ]; then
+            if [ "${WEB_RESULT:-}" != "success" ] || [ -z "${WEB_IMAGE:-}" ]; then
+              echo "::error::image_variant=web requires build_web=true and a successful build-web job"
+              exit 1
+            fi
+            echo "image=$WEB_IMAGE" >> "$GITHUB_OUTPUT"
+            echo "digest=$WEB_DIGEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=$CORE_IMAGE" >> "$GITHUB_OUTPUT"
+            echo "digest=$CORE_DIGEST" >> "$GITHUB_OUTPUT"
+          fi
+          echo "variant=$variant" >> "$GITHUB_OUTPUT"
 
       - name: Configure SSH
         run: |
@@ -245,7 +278,7 @@ jobs:
              OMNIROUTE_COMPOSE_FILE='${{ vars.DEPLOY_COMPOSE_FILE }}' \
              OMNIROUTE_SERVICE='${{ vars.DEPLOY_SERVICE }}' \
              OMNIROUTE_HOST_PORT='${{ vars.DEPLOY_DASHBOARD_PORT }}' \
-             sh scripts/ops/proc-deploy.sh '${{ needs.build-core.outputs.image }}'"
+             sh scripts/ops/proc-deploy.sh '${{ steps.image.outputs.image }}'"
 
       - name: Summary
         if: always()
@@ -253,8 +286,9 @@ jobs:
           {
             echo "### Deploy"
             echo ""
-            echo "- image: \`${{ needs.build-core.outputs.image }}\`"
-            echo "- digest: \`${{ needs.build-core.outputs.digest }}\`"
+            echo "- image: \`${{ steps.image.outputs.image }}\`"
+            echo "- variant: \`${{ steps.image.outputs.variant }}\`"
+            echo "- digest: \`${{ steps.image.outputs.digest }}\`"
             echo "- host: \`${{ vars.DEPLOY_HOST }}\`"
             echo "- result: ${{ job.status }}"
             echo "- health: \`${{ vars.DEPLOY_HEALTH_URL }}\`"
