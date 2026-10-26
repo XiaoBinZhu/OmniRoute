@@ -210,6 +210,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Verify selected image build succeeded
+        run: |
+          VARIANT="${{ inputs.image_variant || 'core' }}"
+          if [ "$VARIANT" = "web" ]; then
+            RESULT="${{ needs.build-web.result }}"
+          else
+            RESULT="${{ needs.build-core.result }}"
+          fi
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::build result for $VARIANT is $RESULT; refusing to deploy empty image"
+            exit 1
+          fi
+
       - name: Resolve image variant
         id: image
         env:

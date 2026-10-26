@@ -205,10 +205,21 @@ export function nestBillingErrorResponse(
   result: Extract<NestPreflightResult, { ok: false }>
 ): Response {
   const status = result.status >= 400 && result.status <= 599 ? result.status : 402;
+  // 不向下游透传 Nest 原始错误文本，避免泄露内部地址/堆栈；按错误码给出安全文案
+  const safeMessage =
+    result.code === "parent_quota_exhausted"
+      ? "父密钥额度已耗尽"
+      : result.code === "insufficient_balance" || status === 402
+        ? "余额不足，请先充值"
+        : result.code === "model_not_found" || result.code === "model_unpriced"
+          ? "模型不可用或未定价"
+          : status >= 500
+            ? "计费服务暂不可用，请稍后重试"
+            : "计费校验失败";
   return new Response(
     JSON.stringify({
       error: {
-        message: result.message,
+        message: safeMessage,
         type: "billing_error",
         code: result.code ?? "nest_billing_error",
       },

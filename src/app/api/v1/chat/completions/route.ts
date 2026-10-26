@@ -312,6 +312,7 @@ export async function POST(request) {
 
     // D2/D3: nest preflight for `sk-` tokens (43 direct path). OmniRoute keys win
     // when they validate, so local keys keep their existing behaviour.
+    const parsedBodyIsRecord = isRecord(parsedBody);
     if (isNestBillingEnabled() && parsedBodyIsRecord && requestedModel) {
       const credential = extractApiKeyCandidates(request).find(isNestBillingKeyCandidate) ?? null;
       if (credential) {
@@ -346,7 +347,6 @@ export async function POST(request) {
     // The parsed body is passed through UNTOUCHED — the actual stream/JSON framing
     // stays decided by chatCore/resolveStreamFlag (legacy streaming default and the
     // per-key `streamDefaultMode: "json"` opt-in are preserved).
-    const parsedBodyIsRecord = isRecord(parsedBody);
     const acceptHeader = request.headers.get("accept") || "";
     const acceptForcesStream =
       parsedBodyIsRecord && acceptHeaderForcesStream(acceptHeader, parsedBody.stream);
