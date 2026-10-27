@@ -1,6 +1,10 @@
--- 213_nest_billing.sql
+-- 214_nest_billing.sql
 -- Durable postflight replay queue (blueprint D2/F5). Nest remains the only
 -- ledger; this table only holds settle payloads that could not be delivered.
+--
+-- Renumbered from 213 to 214 after upstream claimed 213 (api_key_preferred_connections).
+-- DBs that applied the old 213 already have the table: isSchemaAlreadyApplied()
+-- short-circuits this migration so it is never re-executed.
 
 CREATE TABLE IF NOT EXISTS nest_billing_outbox (
   id TEXT PRIMARY KEY,

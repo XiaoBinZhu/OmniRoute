@@ -466,6 +466,10 @@ function isSchemaAlreadyApplied(
       return hasColumn(db, "skills", "mode");
     case "028":
       return hasTable(db, "batches") && hasTable(db, "files");
+    case "214":
+      // Renumbered from 213 (upstream claimed that slot). Databases that already
+      // applied the old 213_nest_billing carry the outbox table — never re-run it.
+      return hasTable(db, "nest_billing_outbox");
     case "029":
       return hasColumn(db, "provider_connections", "max_concurrent");
     case "040":
