@@ -1,6 +1,6 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { callCloudWithMachineId } from "@/shared/utils/cloud";
 import { handleChat } from "@/sse/handlers/chat";
 import { logAdmissionRejection } from "@/sse/handlers/admissionRejectionLog";
 import { generateRequestId } from "@/shared/utils/requestId";
@@ -45,6 +45,28 @@ import {
   isCommonChatGptWebRetirementError,
 } from "@/shared/constants/chatgptWebRetirement";
 import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
+import { extractApiKeyCandidates, resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
+import {
+  isNestBillingEnabled,
+  isNestBillingKeyCandidate,
+  nestBillingErrorResponse,
+  nestPreflight,
+  nestSettle,
+  withNestBilling,
+  type NestBillingContext,
+} from "@/lib/nestBilling";
+import {
+  getBifrostRoutingConfig,
+  resolveRelayRoutingBackend,
+  shouldTryBifrostForRequest,
+  getActiveBifrostCooldown,
+  recordBifrostFailure,
+  clearBifrostFailure,
+  getRoutingFallbackHeader,
+  getRoutingFallbackReasonHeader,
+} from "@/shared/services/bifrost/bifrostRouting";
+import { dispatchToBifrost } from "@/shared/services/bifrost/bifrostClient";
+import { gateBifrostFastPath } from "@/shared/services/bifrost/bifrostFastPathGate";
 
 let initPromise = null;
 
@@ -100,6 +122,9 @@ export async function OPTIONS() {
 
 export async function POST(request) {
   await ensureInitialized();
+
+  let nestCtx: NestBillingContext | null = null;
+  let requestedModel = "";
 
   // Defense-in-depth: the authz proxy (src/proxy.ts) is the primary gate, but
   // its matcher can miss path variants (e.g. uppercase /V1/ aliases), so the
@@ -254,6 +279,7 @@ export async function POST(request) {
         // Preserve the caller-supplied provider identity long enough to enforce
         // retirement. A persisted alias can otherwise rewrite felo-web/... to a
         // healthy provider before getModelInfo or the executor tombstones see it.
+        requestedModel = typeof parsedBody?.model === "string" ? parsedBody.model : "";
         try {
           assertRuntimeModelProviderAvailable(parsedBody.model);
         } catch (error) {
@@ -296,12 +322,43 @@ export async function POST(request) {
       console.error("[SECURITY] Prompt injection guard failed:", error);
     }
 
+    // D2/D3: nest preflight for `sk-` tokens (43 direct path). OmniRoute keys win
+    // when they validate, so local keys keep their existing behaviour.
+    const parsedBodyIsRecord = isRecord(parsedBody);
+    if (isNestBillingEnabled() && parsedBodyIsRecord && requestedModel) {
+      const credential = extractApiKeyCandidates(request).find(isNestBillingKeyCandidate) ?? null;
+      if (credential) {
+        const localKey = await resolveClientApiKey(request).catch(() => ({ valid: false }));
+        if (!localKey.valid) {
+          const bodyText = JSON.stringify(parsedBody);
+          const preflight = await nestPreflight({
+            key: credential,
+            model: requestedModel,
+            stream: parsedBody.stream === true,
+            maxTokens: Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 1) || 1,
+            promptTokens: Math.max(1, Math.ceil(bodyText.length / 4)),
+            bodyDigest: createHash("sha256").update(bodyText).digest("hex"),
+            idempotencyKey: request.headers.get("x-idempotency-key"),
+          });
+          if (!preflight.ok) {
+            return finishAdmission(nestBillingErrorResponse(preflight));
+          }
+          nestCtx = {
+            ticket: preflight.ticket,
+            startedAt: Date.now(),
+            model: requestedModel,
+            promptTokensEstimate: Math.max(1, Math.ceil(bodyText.length / 4)),
+            signal: request.signal,
+          };
+        }
+      }
+    }
+
     // Gate the early SSE keepalive wrapper: only wrap when the client explicitly
     // asks for streaming (body `stream: true`) or the Accept header forces SSE.
     // The parsed body is passed through UNTOUCHED — the actual stream/JSON framing
     // stays decided by chatCore/resolveStreamFlag (legacy streaming default and the
     // per-key `streamDefaultMode: "json"` opt-in are preserved).
-    const parsedBodyIsRecord = isRecord(parsedBody);
     const acceptHeader = request.headers.get("accept") || "";
     const acceptForcesStream =
       parsedBodyIsRecord && acceptHeaderForcesStream(acceptHeader, parsedBody.stream);
@@ -316,6 +373,73 @@ export async function POST(request) {
     const callerCorrelationId = resolveIncomingCorrelationId(
       request.headers.get("x-correlation-id")
     );
+
+    // Bifrost Go sidecar fast-path routing check.
+    // IMPORTANT: never take this path for nest-billed requests — it answers before
+    // handleChat()/withNestBilling(), which would skip settle and the call log.
+    const relayBackend = resolveRelayRoutingBackend();
+    const bifrostConfig = getBifrostRoutingConfig();
+    let fallbackHeaderValue: string | undefined = undefined;
+
+    if (parsedBodyIsRecord && bifrostConfig && !nestCtx) {
+      const bifrostDecision = shouldTryBifrostForRequest(relayBackend, bifrostConfig, parsedBody);
+
+      if (bifrostDecision.tryBifrost) {
+        const cooldown =
+          relayBackend === "auto" ? getActiveBifrostCooldown(bifrostConfig.baseUrl) : null;
+        // The sidecar answers before handleChat(), which owns the API-key policy
+        // (allowedModels, budget, schedule, rate limit): gate it first, or a disabled
+        // key would be served with the server's BIFROST_API_KEY. Skipped during a
+        // cooldown, where handleChat() serves (and polices) the request itself.
+        const fastPathGate = cooldown
+          ? null
+          : await gateBifrostFastPath(request, parsedBody as Record<string, unknown>);
+        if (fastPathGate?.rejection) {
+          return finishAdmission(fastPathGate.rejection);
+        }
+        if (cooldown) {
+          fallbackHeaderValue = `bifrost-cooldown; remaining=${cooldown.remainingMs}`;
+        } else if (fastPathGate && !fastPathGate.allow) {
+          fallbackHeaderValue = "bifrost-ineligible";
+        } else {
+          try {
+            const bifrostResult = await dispatchToBifrost({
+              request,
+              body: parsedBody as Record<string, unknown>,
+              config: bifrostConfig,
+            });
+
+            if (bifrostResult.statusCode < 500) {
+              clearBifrostFailure(bifrostConfig.baseUrl);
+              return finishAdmission(
+                withCompressionHeaderEcho(bifrostResult.response, compressionRequestHeader)
+              );
+            }
+
+            // Bifrost returned 5xx -> trip circuit cooldown & fall through to native handleChat
+            recordBifrostFailure(bifrostConfig.baseUrl, `http_${bifrostResult.statusCode}`);
+            fallbackHeaderValue = "bifrost-error";
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            recordBifrostFailure(bifrostConfig.baseUrl, message);
+            fallbackHeaderValue = "bifrost-error";
+          }
+        }
+      }
+    }
+
+    const applyFallbackHeaders = (res: Response) => {
+      if (!bifrostConfig) return res;
+      const fallbackHeader = getRoutingFallbackHeader(relayBackend, bifrostConfig);
+      if (fallbackHeader || fallbackHeaderValue) {
+        res.headers.set("X-Routing-Fallback", fallbackHeaderValue || fallbackHeader || "bifrost");
+        const reasonCode = getRoutingFallbackReasonHeader(fallbackHeaderValue);
+        if (reasonCode) {
+          res.headers.set("X-Routing-Fallback-Reason", reasonCode);
+        }
+      }
+      return res;
+    };
 
     if (wantsStreaming) {
       const reqId = callerCorrelationId ?? generateRequestId();
@@ -339,16 +463,34 @@ export async function POST(request) {
         extraHeaders: { "X-Correlation-Id": reqId },
         deadlineController: routeDeadlineController,
       });
-      return withCompressionHeaderEcho(streamedResponse, compressionRequestHeader);
+      return withCompressionHeaderEcho(
+        applyFallbackHeaders(withNestBilling(streamedResponse, nestCtx)),
+        compressionRequestHeader
+      );
     }
 
     return finishAdmission(
       withCompressionHeaderEcho(
-        await handleChat(request, null, parsedBody, callerCorrelationId ?? undefined),
+        applyFallbackHeaders(
+          withNestBilling(
+            await handleChat(request, null, parsedBody, callerCorrelationId ?? undefined),
+            nestCtx
+          )
+        ),
         compressionRequestHeader
       )
     );
   } catch (error) {
+    if (nestCtx) {
+      void nestSettle({
+        ticket: nestCtx.ticket,
+        status: 500,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        durationMs: Date.now() - nestCtx.startedAt,
+        error: (error as Error)?.message ?? String(error),
+        upstreamModel: nestCtx.model,
+      });
+    }
     admission.lease?.release();
     throw error;
   }

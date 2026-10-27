@@ -1,6 +1,11 @@
 import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth.ts";
 import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
 import { extractApiKeyCandidates } from "@/sse/services/clientApiKeyResolver.ts";
+import {
+  isNestBillingChatPath,
+  isNestBillingEnabled,
+  isNestBillingKeyCandidate,
+} from "@/lib/nestBilling/config";
 import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow, reject } from "../context";
 
@@ -60,6 +65,16 @@ export const clientApiPolicy: RoutePolicy = {
       if (await validateApiKey(credential)) {
         return allow({ kind: "client_api_key", id: maskKeyId(credential) });
       }
+    }
+
+    // Nest tokens (`sk-`, 43 direct path) are validated by the chat route
+    // preflight, which is the only place that can create a billing hold.
+    if (
+      isNestBillingEnabled() &&
+      isNestBillingChatPath(ctx.request.url) &&
+      credentials.some(isNestBillingKeyCandidate)
+    ) {
+      return allow({ kind: "nest_token_pending", id: maskKeyId(credentials[0]) });
     }
 
     // Issue #2257: when REQUIRE_API_KEY is off, a stale CLI config (Codex

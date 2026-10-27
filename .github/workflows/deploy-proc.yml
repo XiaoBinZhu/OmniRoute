@@ -20,13 +20,6 @@ name: deploy-proc
 #  'true', AND the run must either be a push to `proc` or a manual dispatch with
 #  deploy=true. With DEPLOY_ENABLED=false the workflow is build-and-publish only.
 #
-#  Which image gets deployed is `deploy_image`:
-#    core (default) — headless API image, OMNIROUTE_HEADLESS=1, dashboard 404
-#    web            — full image with the dashboard, OMNIROUTE_HEADLESS=0;
-#                     requires build_web=true in the same dispatch (the deploy
-#                     job waits for build-web, so a failed dashboard build can
-#                     never half-deploy the host)
-#
 #  Required repository configuration (fork owner):
 #    variables: IMAGE_REPOSITORY (lowercase, e.g. ghcr.io/xiaobinzhu/omniroute),
 #               DEPLOY_ENABLED, DEPLOY_HOST, DEPLOY_PORT, DEPLOY_USER,
@@ -45,17 +38,15 @@ on:
         description: "Also build the full dashboard image (:proc-web-<sha>)"
         type: boolean
         default: false
-      deploy:
-        description: "Deploy the built image to the gateway host"
-        type: boolean
-        default: false
-      deploy_image:
-        description: "Which image the deploy job ships (web requires build_web)"
+      image_variant:
+        description: "Image to deploy: core (API only) or web (dashboard included)"
         type: choice
-        options: [core, web]
+        options:
+          - core
+          - web
         default: core
-      build_bun:
-        description: "Also build the Bun-runtime headless core (:proc-bun-<sha>)"
+      deploy:
+        description: "Deploy the built core image to the gateway host"
         type: boolean
         default: false
 
@@ -150,102 +141,10 @@ jobs:
             echo "| profile | API only (dashboard UI stubbed) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ── 1b. Optional Bun-runtime headless core ────────────────────────────────
-  # Same backend-only artifact, but built and run on Bun (oven/bun:1.4.3-slim)
-  # instead of Node. Purpose: the 43 box is 2 vCPU / 3.7 GB, so the *runtime*
-  # footprint matters — Bun usually holds a smaller RSS than Node for the same
-  # proxy workload, and its SQLite path is the native `bun:sqlite` module.
-  #
-  # Why this is not the default: upstream tracks Bun as a best-effort
-  # compatibility target, not a supported runtime (AGENTS.md → Environment), and
-  # `bun run --quiet build` has a history of OOM-killing. It is therefore opt-in
-  # per run and never blocks the Node core image that the gateway actually
-  # deploys. The Node build stays the rollback path.
-  build-core-bun:
-    name: build headless core image (Bun runtime)
-    needs: build-core
-    if: github.event_name == 'workflow_dispatch' && inputs.build_bun
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Resolve image tag
-        id: meta
-        env:
-          REPO: ${{ vars.IMAGE_REPOSITORY }}
-        run: |
-          set -euo pipefail
-          repo="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
-          echo "image=$repo:proc-bun-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push (Bun runtime, API only)
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          # NOT Dockerfile.bun: `bun run build` fails on this codebase
-          # ("module.createRequire failed parsing argument" → "Could not parse
-          # output from TypeScript's --showConfig"), which is why upstream marks
-          # Bun best-effort. `runner-bun` reuses the proven Node builder and only
-          # swaps the runtime, so the artifact is identical to the core image and
-          # the memory comparison has a single variable.
-          target: runner-bun
-          push: true
-          build-args: |
-            OMNIROUTE_USE_TURBOPACK=0
-            OMNIROUTE_BUILD_BACKEND_ONLY=1
-            OMNIROUTE_BUILD_MEMORY_MB=12288
-          tags: ${{ steps.meta.outputs.image }}
-          cache-from: type=gha,scope=bun-core
-          cache-to: type=gha,mode=max,scope=bun-core
-          labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.title=omniroute-core-bun
-
-      - name: Summary
-        run: |
-          {
-            echo "### Headless core image (Bun runtime)"
-            echo ""
-            echo "| field | value |"
-            echo "| --- | --- |"
-            echo "| commit | \`${{ github.sha }}\` |"
-            echo "| image | \`${{ steps.meta.outputs.image }}\` |"
-            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
-            echo "| profile | API only (dashboard UI stubbed), oven/bun:1.4.3-slim |"
-            echo ""
-            echo "Deploy with \`OMNIROUTE_HEALTHCHECK='bun healthcheck.mjs'\` and"
-            echo "\`OMNIROUTE_IMAGE=<image above>\` — the compose stack is identical."
-          } >> "$GITHUB_STEP_SUMMARY"
-
   # ── 2. Optional full/dashboard image ──────────────────────────────────────
-  # Runs strictly AFTER the headless core: the gateway host never builds, and the
-  # backend artifact is the one that must exist first. A failed dashboard build
-  # therefore cannot block or invalidate the core image that gets deployed.
-  #
-  # Also runs on a push to `proc` when the repository variable
-  # DEPLOY_IMAGE_KIND=web — that is the "backend first, then frontend, then
-  # deploy" order this host uses, automated for every release instead of being a
-  # manual dispatch.
   build-web:
     name: build full dashboard image
-    needs: build-core
-    if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.build_web) ||
-      (github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND == 'web')
+    if: github.event_name == 'workflow_dispatch' && inputs.build_web
     runs-on: ubuntu-latest
     timeout-minutes: 150
     outputs:
@@ -279,7 +178,6 @@ jobs:
           push: true
           build-args: |
             OMNIROUTE_USE_TURBOPACK=0
-            OMNIROUTE_BUILD_BACKEND_ONLY=0
             OMNIROUTE_BUILD_MEMORY_MB=12288
             OMNIROUTE_BUILD_WORKERS=2
           tags: ${{ steps.meta.outputs.image }}
@@ -301,60 +199,54 @@ jobs:
   # ── 3. Deploy (pull-only on the host; no build, health-gated, auto-rollback) ─
   deploy:
     name: deploy to gateway host
-    # Both image jobs are listed so the deploy can ship whichever one was built.
-    # `needs` on a job whose `if` evaluated false makes this job skip too, which
-    # is why the condition spells out the core case explicitly: with
-    # deploy_image=core the web job is skipped, and `always()` keeps this job
-    # eligible while the explicit `needs.build-core.result` check keeps it honest.
     needs: [build-core, build-web]
-    # NOTE: GitHub Actions expressions have NO ternary operator — `cond ? a : b`
-    # is a workflow-file parse error and the run dies before any job starts
-    # (run 39534070209). Everything below uses `&&` / `||` only.
     if: >-
       always() &&
       vars.DEPLOY_ENABLED == 'true' &&
-      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy)) &&
-      (
-        (needs.build-core.result == 'success' &&
-          ((github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND != 'web') ||
-           (github.event_name == 'workflow_dispatch' && inputs.deploy_image == 'core'))) ||
-        (needs.build-web.result == 'success' &&
-          ((github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND == 'web') ||
-           (github.event_name == 'workflow_dispatch' && inputs.deploy_image == 'web')))
-      )
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: production
     steps:
       - uses: actions/checkout@v5
 
-      - name: Resolve target image + headless flag
-        id: target
-        env:
-          CORE_IMAGE: ${{ needs.build-core.outputs.image }}
-          WEB_IMAGE: ${{ needs.build-web.outputs.image }}
-          DEPLOY_IMAGE: ${{ github.event_name == 'push' && (vars.DEPLOY_IMAGE_KIND == 'web' && 'web' || 'core') || inputs.deploy_image }}
+      - name: Verify selected image build succeeded
         run: |
-          set -euo pipefail
-          case "${DEPLOY_IMAGE:-core}" in
-            core) image="$CORE_IMAGE"; headless=1 ;;
-            web)
-              if [ -z "${WEB_IMAGE:-}" ]; then
-                echo "::error::deploy_image=web but build-web did not produce an image (set build_web=true)"
-                exit 1
-              fi
-              image="$WEB_IMAGE"; headless=0 ;;
-            *) echo "::error::unknown deploy_image '${DEPLOY_IMAGE}'"; exit 1 ;;
-          esac
-          if [ -z "${image:-}" ]; then
-            echo "::error::no image to deploy (build-core produced nothing)"
+          VARIANT="${{ inputs.image_variant || 'core' }}"
+          if [ "$VARIANT" = "web" ]; then
+            RESULT="${{ needs.build-web.result }}"
+          else
+            RESULT="${{ needs.build-core.result }}"
+          fi
+          if [ "$RESULT" != "success" ]; then
+            echo "::error::build result for $VARIANT is $RESULT; refusing to deploy empty image"
             exit 1
           fi
-          {
-            echo "image=$image"
-            echo "headless=$headless"
-          } >> "$GITHUB_OUTPUT"
-          echo "target image: $image (headless=$headless)"
+
+      - name: Resolve image variant
+        id: image
+        env:
+          VARIANT: ${{ inputs.image_variant || 'core' }}
+          CORE_IMAGE: ${{ needs.build-core.outputs.image }}
+          CORE_DIGEST: ${{ needs.build-core.outputs.digest }}
+          WEB_IMAGE: ${{ needs.build-web.outputs.image }}
+          WEB_DIGEST: ${{ needs.build-web.outputs.digest }}
+          WEB_RESULT: ${{ needs.build-web.result }}
+        run: |
+          set -euo pipefail
+          variant="${VARIANT:-core}"
+          if [ "$variant" = "web" ]; then
+            if [ "${WEB_RESULT:-}" != "success" ] || [ -z "${WEB_IMAGE:-}" ]; then
+              echo "::error::image_variant=web requires build_web=true and a successful build-web job"
+              exit 1
+            fi
+            echo "image=$WEB_IMAGE" >> "$GITHUB_OUTPUT"
+            echo "digest=$WEB_DIGEST" >> "$GITHUB_OUTPUT"
+          else
+            echo "image=$CORE_IMAGE" >> "$GITHUB_OUTPUT"
+            echo "digest=$CORE_DIGEST" >> "$GITHUB_OUTPUT"
+          fi
+          echo "variant=$variant" >> "$GITHUB_OUTPUT"
 
       - name: Configure SSH
         run: |
@@ -393,22 +285,13 @@ jobs:
       - name: Deploy (pull, up --no-build, health gate, rollback)
         run: |
           set -euo pipefail
-          # OMNIROUTE_HEADLESS is passed explicitly: the deploy job ships either
-          # the headless core (1) or the dashboard image (0), and the host .env is
-          # only a fallback for manual runs. OMNIROUTE_HEALTHCHECK is NOT passed —
-          # proc-deploy.sh derives it from the image runtime (node vs bun) so a
-          # Bun rollback target is not probed with `node healthcheck.mjs`.
           ssh -i ~/.ssh/deploy_key -p "${{ vars.DEPLOY_PORT }}" \
             "${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}" \
             "cd '${{ vars.DEPLOY_PATH }}' && \
              OMNIROUTE_COMPOSE_FILE='${{ vars.DEPLOY_COMPOSE_FILE }}' \
              OMNIROUTE_SERVICE='${{ vars.DEPLOY_SERVICE }}' \
              OMNIROUTE_HOST_PORT='${{ vars.DEPLOY_DASHBOARD_PORT }}' \
-             OMNIROUTE_HEADLESS='${{ steps.target.outputs.headless }}' \
-             OMNIROUTE_MEM_LIMIT='${{ vars.DEPLOY_MEM_LIMIT || '1280m' }}' \
-             OMNIROUTE_MEMORY_MB='${{ vars.DEPLOY_MEMORY_MB || '768' }}' \
-             sh scripts/ops/proc-deploy.sh '${{ steps.target.outputs.image }}' \
-               --keep '${{ vars.DEPLOY_KEEP_RELEASES || '3' }}'"
+             sh scripts/ops/proc-deploy.sh '${{ steps.image.outputs.image }}'"
 
       - name: Summary
         if: always()
@@ -416,9 +299,9 @@ jobs:
           {
             echo "### Deploy"
             echo ""
-            echo "- image: \`${{ steps.target.outputs.image || needs.build-core.outputs.image }}\`"
-            echo "- digest: \`${{ needs.build-core.outputs.digest }}\`"
-            echo "- headless: \`${{ steps.target.outputs.headless }}\`"
+            echo "- image: \`${{ steps.image.outputs.image }}\`"
+            echo "- variant: \`${{ steps.image.outputs.variant }}\`"
+            echo "- digest: \`${{ steps.image.outputs.digest }}\`"
             echo "- host: \`${{ vars.DEPLOY_HOST }}\`"
             echo "- result: ${{ job.status }}"
             echo "- health: \`${{ vars.DEPLOY_HEALTH_URL }}\`"
