@@ -1,3 +1,8 @@
+---
+title: "Upstream auto-sync & proc deployment"
+lastUpdated: 2026-10-28
+---
+
 # 上游自动同步与 proc 部署（upstream-sync）
 
 本仓库是 `diegosouzapw/OmniRoute` 的 fork，分支模型与上游不同，改动前先读本文。
