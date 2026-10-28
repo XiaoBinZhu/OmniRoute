@@ -144,7 +144,11 @@ jobs:
   # ── 2. Optional full/dashboard image ──────────────────────────────────────
   build-web:
     name: build full dashboard image
-    if: github.event_name == 'workflow_dispatch' && inputs.build_web
+    # push proc 时按仓库变量 DEPLOY_IMAGE_KIND 构建（当前 web，与线上一致）；
+    # workflow_dispatch 时沿用显式输入。
+    if: >-
+      (github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND == 'web') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_web)
     runs-on: ubuntu-latest
     timeout-minutes: 150
     outputs:
@@ -181,8 +185,10 @@ jobs:
             OMNIROUTE_BUILD_MEMORY_MB=12288
             OMNIROUTE_BUILD_WORKERS=2
           tags: ${{ steps.meta.outputs.image }}
-          cache-from: type=gha,scope=core
-          cache-to: type=gha,mode=max,scope=web
+          cache-from: |
+            type=gha,scope=web
+            type=gha,scope=core
+          cache-to: type=gha,mode=min,scope=web
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=omniroute-web
@@ -212,7 +218,7 @@ jobs:
 
       - name: Verify selected image build succeeded
         run: |
-          VARIANT="${{ inputs.image_variant || 'core' }}"
+          VARIANT="${{ inputs.image_variant || (github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND) || 'core' }}"
           if [ "$VARIANT" = "web" ]; then
             RESULT="${{ needs.build-web.result }}"
           else
@@ -226,7 +232,7 @@ jobs:
       - name: Resolve image variant
         id: image
         env:
-          VARIANT: ${{ inputs.image_variant || 'core' }}
+          VARIANT: ${{ inputs.image_variant || (github.event_name == 'push' && vars.DEPLOY_IMAGE_KIND) || 'core' }}
           CORE_IMAGE: ${{ needs.build-core.outputs.image }}
           CORE_DIGEST: ${{ needs.build-core.outputs.digest }}
           WEB_IMAGE: ${{ needs.build-web.outputs.image }}
