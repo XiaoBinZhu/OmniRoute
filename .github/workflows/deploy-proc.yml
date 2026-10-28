@@ -181,8 +181,10 @@ jobs:
             OMNIROUTE_BUILD_MEMORY_MB=12288
             OMNIROUTE_BUILD_WORKERS=2
           tags: ${{ steps.meta.outputs.image }}
-          cache-from: type=gha,scope=core
-          cache-to: type=gha,mode=max,scope=web
+          cache-from: |
+            type=gha,scope=web
+            type=gha,scope=core
+          cache-to: type=gha,mode=min,scope=web
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=omniroute-web
