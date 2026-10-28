@@ -25,6 +25,8 @@ concurrency:
 env:
   INTERVAL_SECONDS: "259200" # 72h 安全门禁
   PROC_WORKFLOW: deploy-proc.yml
+  # gate / repair-deploy 不 checkout 仓库，gh 无法从 .git 推断仓库，必须显式指定
+  GH_REPO: ${{ github.repository }}
   IMAGE_VARIANT: ${{ vars.DEPLOY_IMAGE_KIND || 'web' }}
   BUILD_WEB: ${{ vars.DEPLOY_IMAGE_KIND != 'core' }}
 
