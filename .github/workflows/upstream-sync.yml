@@ -1,0 +1,164 @@
+name: upstream-sync
+
+# schedule 只在仓库【默认分支】求值（本 fork 已把默认分支设为 dev）。
+# 不要把本文件放到 main：main 是上游纯净镜像，sync-upstream.mjs 每次都会
+# --force-with-lease 把它重置回上游 tip，放在 main 上会被自我擦除。
+on:
+  schedule:
+    # 固定每周日 04:00 北京时间 = 每周六 20:00 UTC（GitHub cron 只支持 UTC）
+    - cron: "0 20 * * 6"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Ignore the 72h window and sync now"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # push main / dev / proc
+  actions: write # dispatch deploy-proc + read run history
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  INTERVAL_SECONDS: "259200" # 72h 安全门禁
+  PROC_WORKFLOW: deploy-proc.yml
+  IMAGE_VARIANT: ${{ vars.DEPLOY_IMAGE_KIND || 'web' }}
+  BUILD_WEB: ${{ vars.DEPLOY_IMAGE_KIND != 'core' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      due: ${{ steps.gate.outputs.due }}
+      proc_sha: ${{ steps.gate.outputs.proc_sha }}
+      deployed_sha: ${{ steps.gate.outputs.deployed_sha }}
+    steps:
+      - id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+
+          # 时钟 1：proc 分支最后一次提交
+          proc_json=$(gh api "repos/$GITHUB_REPOSITORY/commits/proc" 2>/dev/null || echo '{}')
+          proc_sha=$(printf '%s' "$proc_json" | jq -r '.sha // ""')
+          proc_time=$(printf '%s' "$proc_json" | jq -r '.commit.committer.date // ""')
+          proc_epoch=0
+          if [ -n "$proc_time" ]; then proc_epoch=$(date -u -d "$proc_time" +%s); fi
+
+          # 时钟 2：deploy-proc 最近一次 run（含手动 push / 手动 dispatch）
+          runs=$(gh run list --workflow="$PROC_WORKFLOW" --branch proc --limit 20 \
+                   --json createdAt,conclusion,headSha 2>/dev/null || echo '[]')
+          last_any_time=$(printf '%s' "$runs" | jq -r '.[0].createdAt // ""')
+          last_ok_time=$(printf '%s' "$runs" | jq -r '[.[] | select(.conclusion=="success")][0].createdAt // ""')
+          deployed_sha=$(printf '%s' "$runs" | jq -r '[.[] | select(.conclusion=="success")][0].headSha // ""')
+
+          last_any_epoch=0; [ -n "$last_any_time" ] && last_any_epoch=$(date -u -d "$last_any_time" +%s)
+          last_activity=$(( proc_epoch > last_any_epoch ? proc_epoch : last_any_epoch ))
+          age=$(( now - last_activity ))
+
+          # 同步失败冷却：24h 内失败过就不再重试（force 除外）。
+          # 必须跳过当前这一次 in_progress 的 run，否则永远看不到上次的失败。
+          sync_runs=$(gh run list --workflow="upstream-sync.yml" --branch dev --limit 10 \
+                        --json status,conclusion,createdAt 2>/dev/null || echo '[]')
+          sync_concl=$(printf '%s' "$sync_runs" | jq -r '[.[] | select(.status=="completed")][0].conclusion // ""')
+          sync_time=$(printf '%s' "$sync_runs" | jq -r '[.[] | select(.status=="completed")][0].createdAt // ""')
+          cooldown=false
+          if [ "$sync_concl" = "failure" ] && [ -n "$sync_time" ]; then
+            if [ $(( now - $(date -u -d "$sync_time" +%s) )) -lt 86400 ]; then cooldown=true; fi
+          fi
+
+          due=false
+          if [ "$age" -ge "$INTERVAL_SECONDS" ] && [ "$cooldown" = "false" ]; then due=true; fi
+          if [ "${{ inputs.force }}" = "true" ]; then due=true; fi
+
+          echo "due=$due" >> "$GITHUB_OUTPUT"
+          echo "proc_sha=$proc_sha" >> "$GITHUB_OUTPUT"
+          echo "deployed_sha=$deployed_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### upstream-sync 门禁"
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| proc tip | \`${proc_sha:0:12}\` (commit ${proc_time:-n/a}) |"
+            echo "| 最近一次 deploy-proc | ${last_any_time:-never} |"
+            echo "| 最近一次成功部署 | ${last_ok_time:-never} (\`${deployed_sha:0:12}\`) |"
+            echo "| 距上次 PROC 更新 | $(( age / 3600 ))h / 阈值 $(( INTERVAL_SECONDS / 3600 ))h |"
+            echo "| 失败冷却 | $cooldown |"
+            echo "| 结论 | due=$due |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sync:
+    needs: gate
+    if: needs.gate.outputs.due == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: true
+      - name: 配置 git 身份与 remote 布局
+        run: |
+          set -euo pipefail
+          git config user.name  "upstream-sync"
+          git config user.email "upstream-sync@users.noreply.github.com"
+          git remote rename origin fork
+          git remote add origin https://github.com/diegosouzapw/OmniRoute.git
+      - name: 同步 upstream → main + dev
+        run: node scripts/dev/sync-upstream.mjs
+      - name: 合并 dev → proc
+        run: node scripts/ops/promote-proc.mjs
+      - name: 触发 web 镜像部署
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run "$PROC_WORKFLOW" --ref proc \
+            -f deploy=true \
+            -f build_web="$BUILD_WEB" \
+            -f image_variant="$IMAGE_VARIANT"
+          echo "- dispatched deploy-proc（variant=$IMAGE_VARIANT, build_web=$BUILD_WEB）" >> "$GITHUB_STEP_SUMMARY"
+
+  repair-deploy:
+    needs: gate
+    if: >-
+      always() &&
+      needs.gate.result == 'success' &&
+      needs.gate.outputs.due != 'true' &&
+      needs.gate.outputs.proc_sha != '' &&
+      needs.gate.outputs.proc_sha != needs.gate.outputs.deployed_sha
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 冷却与在途检查（12h 内失败 / 部署进行中则跳过）
+        id: cool
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          last=$(gh run list --workflow="$PROC_WORKFLOW" --branch proc --limit 1 \
+                   --json status,conclusion,createdAt)
+          status=$(printf '%s' "$last" | jq -r '.[0].status // ""')
+          concl=$(printf '%s' "$last" | jq -r '.[0].conclusion // ""')
+          t=$(printf '%s' "$last" | jq -r '.[0].createdAt // ""')
+          ok=true
+          case "$status" in queued|in_progress|waiting|pending) ok=false ;; esac
+          if [ "$concl" = "failure" ] && [ -n "$t" ]; then
+            if [ $(( $(date -u +%s) - $(date -u -d "$t" +%s) )) -lt 43200 ]; then ok=false; fi
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+      - name: 补发部署
+        if: steps.cool.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run "$PROC_WORKFLOW" --ref proc \
+            -f deploy=true -f build_web="$BUILD_WEB" -f image_variant="$IMAGE_VARIANT"
+          echo "- proc 已前进但未部署，已补发 deploy-proc" >> "$GITHUB_STEP_SUMMARY"
