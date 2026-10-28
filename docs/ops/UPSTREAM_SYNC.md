@@ -55,3 +55,5 @@ gh workflow enable upstream-sync -R XiaoBinZhu/OmniRoute
 - 不要使用 GitHub 的 “Sync fork” 按钮：默认分支已改为 `dev`，该按钮会把上游合并进 `dev`，绕过本流程的 72h 门禁与 proc 推进。
 - `vars.DEPLOY_IMAGE_KIND`（当前 `web`）决定自动部署的镜像变体；改为 `core` 会部署无 dashboard 的 headless 镜像。
 - `vars.DEPLOY_ENABLED` 必须为 `true`，否则 deploy job 会被跳过（此时 repair 的“已部署”判断不再准确）。
+- workflow 必须有 `workflows: write` 权限：上游可能新增/修改 `.github/workflows/*`，缺少该权限时 GITHUB_TOKEN 推 main/dev 会被 GitHub 拒绝。
+- fork 仓库若关闭 Issues，冲突提示只写 Step Summary（步骤不会因此失败）。
