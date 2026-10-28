@@ -69,6 +69,15 @@ done
 [ -n "$IMAGE" ] || IMAGE="${OMNIROUTE_IMAGE:-}"
 [ -n "$IMAGE" ] || { echo "error: no image given (argument or OMNIROUTE_IMAGE)" >&2; exit 1; }
 
+# Dashboard availability follows the image variant, never a stale .env:
+# web images ship the dashboard (headless=0), core images are API-only (headless=1).
+# A stale .env previously left the dashboard answering "dashboard disabled (headless)".
+case "$IMAGE" in
+  *proc-web-*) OMNIROUTE_HEADLESS=0 ;;
+  *) OMNIROUTE_HEADLESS=1 ;;
+esac
+export OMNIROUTE_HEADLESS
+
 case "$IMAGE" in
   *:latest) echo "refusing to deploy a mutable 'latest' tag: $IMAGE" >&2; exit 1 ;;
 esac
@@ -150,6 +159,10 @@ else
     echo "error: no previous image recorded; manual action required" >&2
     exit 4
   fi
+  case "${PREVIOUS_IMAGE:-}" in
+    *proc-web-*) OMNIROUTE_HEADLESS=0 ;;
+    *) OMNIROUTE_HEADLESS=1 ;;
+  esac
   OMNIROUTE_IMAGE="${PREVIOUS_IMAGE:-$PREVIOUS_ID}" \
     docker compose -f "$COMPOSE_FILE" up -d --no-build --remove-orphans || exit 4
   if wait_health; then
@@ -175,5 +188,5 @@ if [ "$KEEP" -gt 0 ] && [ -f "$RELEASES_FILE" ]; then
 fi
 
 log "deployed $IMAGE"
-log "dashboard: disabled (headless) unless OMNIROUTE_HEADLESS=0"
+log "dashboard: $([ "$OMNIROUTE_HEADLESS" = "0" ] && echo enabled || echo 'disabled (headless)')"
 log "API:       http://127.0.0.1:${HOST_PORT}/v1  (management: /api)"
