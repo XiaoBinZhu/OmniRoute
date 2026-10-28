@@ -17,6 +17,7 @@ on:
 permissions:
   contents: write # push main / dev / proc
   actions: write # dispatch deploy-proc + read run history
+  issues: write # 同步冲突时创建/更新 issue
 
 concurrency:
   group: upstream-sync
@@ -126,6 +127,61 @@ jobs:
             -f build_web="$BUILD_WEB" \
             -f image_variant="$IMAGE_VARIANT"
           echo "- dispatched deploy-proc（variant=$IMAGE_VARIANT, build_web=$BUILD_WEB）" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 成功时关闭历史冲突 issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --state open --limit 50 --json number,title \
+                       --jq '[.[] | select(.title | startswith("[upstream-sync] 同步冲突"))] | .[].number')
+          for n in $existing; do
+            gh issue close "$n" --comment "自动同步已恢复（run $GITHUB_RUN_ID）"
+          done
+
+      - name: 冲突/失败提示（已停止部署）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          conflict_files=$(git diff --name-only --diff-filter=U || true)
+          {
+            echo "### upstream-sync 失败：已停止部署"
+            echo ""
+            echo "**没有推送 proc，也没有触发 deploy-proc。**"
+            echo ""
+            echo "#### 未合并文件"
+            echo '```'
+            echo "${conflict_files:-（无未合并文件，失败发生在合并之前）}"
+            echo '```'
+            echo "#### 工作树"
+            echo '```'
+            git status --short --branch || true
+            echo '```'
+            echo "本地处理：\`npm run sync:upstream:dry\` → 解决冲突 → \`npm run sync:upstream\` → \`npm run sync:proc\`。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          body=$(cat <<EOF
+          自动同步失败，**已停止部署**（未推送 proc、未触发 deploy-proc）。
+
+          - Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - 冲突文件：
+          \`\`\`
+          ${conflict_files:-（无未合并文件，失败发生在合并之前）}
+          \`\`\`
+
+          本地处理：\`npm run sync:upstream:dry\` → 解决冲突 → \`npm run sync:upstream\` → \`npm run sync:proc\`。
+          EOF
+          )
+          existing=$(gh issue list --state open --limit 50 --json number,title \
+                       --jq '[.[] | select(.title | startswith("[upstream-sync] 同步冲突"))][0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "[upstream-sync] 同步冲突 $(date -u +%F)" --body "$body"
+          fi
 
   repair-deploy:
     needs: gate

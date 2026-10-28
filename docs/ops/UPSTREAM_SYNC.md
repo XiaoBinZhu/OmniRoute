@@ -21,6 +21,8 @@ GitHub Actions 的 `schedule` 只在仓库**默认分支**的最新提交上求�
 - 流程：`sync-upstream.mjs`（main 镜像 + merge upstream→dev）→ `promote-proc.mjs`（merge dev→proc）→ 显式 dispatch `deploy-proc`（`-f deploy=true -f build_web=true -f image_variant=web`）。
 - 手动 push proc 或手动 dispatch deploy-proc 会重置 72h 计时（例如周六手动部署过，周日自动跳过）。
 - `repair-deploy` job 在每次门禁运行时检查“proc 已前进但未成功部署”并自动补发（12h 内失败过或部署进行中则跳过）。
+- 每次执行前会把 CI 的 `dev` fast-forward 到 fork 的最新 `dev`（本地运行时若本地 `dev` 与 fork 分叉——有未推送提交且远端也前进——会直接停止，绝不覆盖）。
+- 冲突处理：Git 自动合并无冲突部分；真正冲突时 workflow 失败，**不推送 proc、不触发部署**，并在 Step Summary 与 GitHub Issue（标题 `[upstream-sync] 同步冲突 ...`）中列出冲突文件；下次成功同步后自动关闭该 Issue。
 
 ## 手动操作
 
@@ -43,7 +45,7 @@ gh workflow enable upstream-sync -R XiaoBinZhu/OmniRoute
 
 ## 失败与回滚
 
-- merge 冲突 / 推送被拒：workflow 失败，**不推送任何东西、不部署**；用 `npm run sync:upstream:dry` 在本地复现后手工解决。
+- merge 冲突 / 推送被拒：workflow 失败，**不推送 proc、不部署**（main 可能已对齐上游，这是无害的镜像更新）；冲突文件会写进 Step Summary 并创建 Issue；用 `npm run sync:upstream:dry` 在本地复现后手工解决。
 - 部署失败：`deploy-proc` 自带健康门禁与自动回滚（`scripts/ops/proc-deploy.sh`）。
 - 回滚默认分支：`gh api -X PATCH repos/XiaoBinZhu/OmniRoute -f default_branch=main`。
 - 回滚生产：见 `docs/ops/PROC_HEADLESS_DEPLOY.md` 的 rollback 段（`.proc-releases` 记录最近 3 个镜像）。

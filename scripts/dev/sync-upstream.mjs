@@ -132,6 +132,32 @@ const upstreamRef = `${UPSTREAM}/${UPSTREAM_BRANCH}`;
 const upstreamTip = git(["rev-parse", upstreamRef]);
 ok(`${upstreamRef} = ${short(upstreamTip)}`);
 
+// 后续 merge/push 必须基于 fork 的最新 dev：本地 dev 只允许 fast-forward；
+// 一旦分叉（本地有未推送提交且远端也前进）就停止，绝不覆盖任何提交。
+const forkDev = git(["rev-parse", "--verify", "--quiet", `refs/remotes/${FORK}/dev`], {
+  allowFail: true,
+});
+if (forkDev) {
+  const behind = Number(git(["rev-list", "--count", `dev..${FORK}/dev`]));
+  const ahead = Number(git(["rev-list", "--count", `${FORK}/dev..dev`]));
+  if (behind > 0 && ahead === 0) {
+    if (dryRun) {
+      warn(`dry-run: dev would fast-forward to ${FORK}/dev (${short(forkDev)})`);
+    } else {
+      if (git(["rev-parse", "--abbrev-ref", "HEAD"]) !== "dev") git(["switch", "dev"]);
+      git(["merge", "--ff-only", `${FORK}/dev`]);
+      ok(`dev fast-forwarded to ${FORK}/dev (${short(git(["rev-parse", "dev"]))})`);
+    }
+  } else if (behind > 0) {
+    die(
+      `local dev has diverged from ${FORK}/dev (${ahead} ahead / ${behind} behind).\n` +
+        "       Rebase or merge manually, then run this script again."
+    );
+  } else {
+    ok(`dev is up to date with ${FORK}/dev (${short(forkDev)})`);
+  }
+}
+
 // --- 3. fast-forward local main to the upstream tip --------------------------
 step("3/6 align local main with the upstream tip");
 const mainBefore = git(["rev-parse", "main"], { allowFail: true }) || undefined;
