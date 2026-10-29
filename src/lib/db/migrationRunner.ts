@@ -1211,7 +1211,11 @@ export function getMigrationStatus(db: SqliteAdapter): {
 
   const appliedVersions = new Set(appliedRows.map((r) => r.version));
   const allFiles = getMigrationFiles();
-  const pending = allFiles.filter((f) => !appliedVersions.has(f.version));
+  // 与 runMigrations 保持一致：已存在目标 schema 的迁移不再计为 pending
+  // （例如 nest_billing 从 213/214 改号为 215，老库已有 outbox 表）
+  const pending = allFiles.filter(
+    (f) => !appliedVersions.has(f.version) && !isSchemaAlreadyApplied(db, f)
+  );
 
   return { applied: appliedRows, pending };
 }

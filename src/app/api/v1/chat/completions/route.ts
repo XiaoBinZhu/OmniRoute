@@ -322,6 +322,12 @@ export async function POST(request) {
       console.error("[SECURITY] Prompt injection guard failed:", error);
     }
 
+    // #11739: preserve caller-provided X-Correlation-Id when present; generate only when absent.
+    // 必须在 nest preflight 之前声明：preflight 成功时要用它固定计费 reqId。
+    const callerCorrelationId = resolveIncomingCorrelationId(
+      request.headers.get("x-correlation-id")
+    );
+
     // D2/D3: nest preflight for `sk-` tokens (43 direct path). OmniRoute keys win
     // when they validate, so local keys keep their existing behaviour.
     const parsedBodyIsRecord = isRecord(parsedBody);
@@ -335,7 +341,9 @@ export async function POST(request) {
             key: credential,
             model: requestedModel,
             stream: parsedBody.stream === true,
-            maxTokens: Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 1) || 1,
+            // F15：未声明 max_tokens 时按 4096 估算，避免预扣被低估
+            maxTokens:
+              Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 4096) || 4096,
             promptTokens: Math.max(1, Math.ceil(bodyText.length / 4)),
             bodyDigest: createHash("sha256").update(bodyText).digest("hex"),
             idempotencyKey: request.headers.get("x-idempotency-key"),
@@ -349,6 +357,9 @@ export async function POST(request) {
             model: requestedModel,
             promptTokensEstimate: Math.max(1, Math.ceil(bodyText.length / 4)),
             signal: request.signal,
+            // 计费同步（D4）：在 preflight 成功时即固定 reqId，后续 stream/JSON/catch/abort
+            // 全部复用它，确保 settle 的 omnirouteRequestId === call_logs.correlation_id。
+            requestId: callerCorrelationId ?? generateRequestId(),
           };
         }
       }
@@ -368,11 +379,6 @@ export async function POST(request) {
     // on the response when internal early-returns (idempotency cache, some combo
     // paths) drop the meta the docs promise.
     const compressionRequestHeader = readCompressionRequestHeader(request);
-
-    // #11739: preserve caller-provided X-Correlation-Id when present; generate only when absent.
-    const callerCorrelationId = resolveIncomingCorrelationId(
-      request.headers.get("x-correlation-id")
-    );
 
     // Bifrost Go sidecar fast-path routing check.
     // IMPORTANT: never take this path for nest-billed requests — it answers before
@@ -442,7 +448,7 @@ export async function POST(request) {
     };
 
     if (wantsStreaming) {
-      const reqId = callerCorrelationId ?? generateRequestId();
+      const reqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
       const { signal: routeDeadlineSignal, deadlineController: routeDeadlineController } =
         createStreamDeadlineSignal(request.signal);
       // Wrap the real handler response, not the synthetic early-keepalive response. If the
@@ -469,13 +475,11 @@ export async function POST(request) {
       );
     }
 
+    const jsonReqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
     return finishAdmission(
       withCompressionHeaderEcho(
         applyFallbackHeaders(
-          withNestBilling(
-            await handleChat(request, null, parsedBody, callerCorrelationId ?? undefined),
-            nestCtx
-          )
+          withNestBilling(await handleChat(request, null, parsedBody, jsonReqId), nestCtx)
         ),
         compressionRequestHeader
       )
@@ -489,6 +493,8 @@ export async function POST(request) {
         durationMs: Date.now() - nestCtx.startedAt,
         error: (error as Error)?.message ?? String(error),
         upstreamModel: nestCtx.model,
+        omnirouteRequestId: nestCtx.requestId ?? null,
+        traceId: nestCtx.requestId ?? null,
       });
     }
     admission.lease?.release();

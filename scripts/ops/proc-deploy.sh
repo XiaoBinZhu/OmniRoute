@@ -74,6 +74,15 @@ done
 [ -n "$IMAGE" ] || IMAGE="${OMNIROUTE_IMAGE:-}"
 [ -n "$IMAGE" ] || { echo "error: no image given (argument or OMNIROUTE_IMAGE)" >&2; exit 1; }
 
+# Dashboard availability follows the image variant, never a stale .env:
+# web images ship the dashboard (headless=0), core images are API-only (headless=1).
+# A stale .env previously left the dashboard answering "dashboard disabled (headless)".
+case "$IMAGE" in
+  *proc-web-*) OMNIROUTE_HEADLESS=0 ;;
+  *) OMNIROUTE_HEADLESS=1 ;;
+esac
+export OMNIROUTE_HEADLESS
+
 case "$IMAGE" in
   *:latest) echo "refusing to deploy a mutable 'latest' tag: $IMAGE" >&2; exit 1 ;;
 esac
@@ -253,12 +262,18 @@ else
   # re-detect its probe instead of reusing the new image's. An explicit
   # OMNIROUTE_HEALTHCHECK override still wins (detect_healthcheck honours it).
   ROLLBACK_HEALTHCHECK="$(detect_healthcheck "$PREVIOUS_REF")"
+  # Same variant rule as the forward path: web images ship the dashboard.
+  case "$PREVIOUS_REF" in
+    *proc-web-*) ROLLBACK_HEADLESS=0 ;;
+    *) ROLLBACK_HEADLESS=1 ;;
+  esac
   OMNIROUTE_HEALTHCHECK="$ROLLBACK_HEALTHCHECK" \
     OMNIROUTE_IMAGE="$PREVIOUS_REF" \
-    OMNIROUTE_HEADLESS="${OMNIROUTE_HEADLESS:-1}" \
+    OMNIROUTE_HEADLESS="$ROLLBACK_HEADLESS" \
     docker compose -f "$COMPOSE_FILE" up -d --no-build --remove-orphans || exit 4
   persist_env OMNIROUTE_IMAGE "$PREVIOUS_REF"
   persist_env OMNIROUTE_HEALTHCHECK "$ROLLBACK_HEALTHCHECK"
+  persist_env OMNIROUTE_HEADLESS "$ROLLBACK_HEADLESS"
   if wait_health; then
     log "rollback healthy — deployment aborted, previous release restored"
     exit 3
@@ -282,5 +297,5 @@ if [ "$KEEP" -gt 0 ] && [ -f "$RELEASES_FILE" ]; then
 fi
 
 log "deployed $IMAGE"
-log "dashboard: disabled (headless) unless OMNIROUTE_HEADLESS=0"
+log "dashboard: $([ "$OMNIROUTE_HEADLESS" = "0" ] && echo enabled || echo 'disabled (headless)')"
 log "API:       http://127.0.0.1:${HOST_PORT}/v1  (management: /api)"
