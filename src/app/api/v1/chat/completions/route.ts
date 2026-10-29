@@ -1,6 +1,6 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { callCloudWithMachineId } from "@/shared/utils/cloud";
 import { handleChat } from "@/sse/handlers/chat";
 import { logAdmissionRejection } from "@/sse/handlers/admissionRejectionLog";
 import { generateRequestId } from "@/shared/utils/requestId";
@@ -45,6 +45,16 @@ import {
   isCommonChatGptWebRetirementError,
 } from "@/shared/constants/chatgptWebRetirement";
 import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
+import { extractApiKeyCandidates, resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
+import {
+  isNestBillingEnabled,
+  isNestBillingKeyCandidate,
+  nestBillingErrorResponse,
+  nestPreflight,
+  nestSettle,
+  withNestBilling,
+  type NestBillingContext,
+} from "@/lib/nestBilling";
 import {
   getBifrostRoutingConfig,
   resolveRelayRoutingBackend,
@@ -112,6 +122,9 @@ export async function OPTIONS() {
 
 export async function POST(request) {
   await ensureInitialized();
+
+  let nestCtx: NestBillingContext | null = null;
+  let requestedModel = "";
 
   // Defense-in-depth: the authz proxy (src/proxy.ts) is the primary gate, but
   // its matcher can miss path variants (e.g. uppercase /V1/ aliases), so the
@@ -266,6 +279,7 @@ export async function POST(request) {
         // Preserve the caller-supplied provider identity long enough to enforce
         // retirement. A persisted alias can otherwise rewrite felo-web/... to a
         // healthy provider before getModelInfo or the executor tombstones see it.
+        requestedModel = typeof parsedBody?.model === "string" ? parsedBody.model : "";
         try {
           assertRuntimeModelProviderAvailable(parsedBody.model);
         } catch (error) {
@@ -308,12 +322,54 @@ export async function POST(request) {
       console.error("[SECURITY] Prompt injection guard failed:", error);
     }
 
+    // #11739: preserve caller-provided X-Correlation-Id when present; generate only when absent.
+    // 必须在 nest preflight 之前声明：preflight 成功时要用它固定计费 reqId。
+    const callerCorrelationId = resolveIncomingCorrelationId(
+      request.headers.get("x-correlation-id")
+    );
+
+    // D2/D3: nest preflight for `sk-` tokens (43 direct path). OmniRoute keys win
+    // when they validate, so local keys keep their existing behaviour.
+    const parsedBodyIsRecord = isRecord(parsedBody);
+    if (isNestBillingEnabled() && parsedBodyIsRecord && requestedModel) {
+      const credential = extractApiKeyCandidates(request).find(isNestBillingKeyCandidate) ?? null;
+      if (credential) {
+        const localKey = await resolveClientApiKey(request).catch(() => ({ valid: false }));
+        if (!localKey.valid) {
+          const bodyText = JSON.stringify(parsedBody);
+          const preflight = await nestPreflight({
+            key: credential,
+            model: requestedModel,
+            stream: parsedBody.stream === true,
+            // F15：未声明 max_tokens 时按 4096 估算，避免预扣被低估
+            maxTokens:
+              Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 4096) || 4096,
+            promptTokens: Math.max(1, Math.ceil(bodyText.length / 4)),
+            bodyDigest: createHash("sha256").update(bodyText).digest("hex"),
+            idempotencyKey: request.headers.get("x-idempotency-key"),
+          });
+          if (!preflight.ok) {
+            return finishAdmission(nestBillingErrorResponse(preflight));
+          }
+          nestCtx = {
+            ticket: preflight.ticket,
+            startedAt: Date.now(),
+            model: requestedModel,
+            promptTokensEstimate: Math.max(1, Math.ceil(bodyText.length / 4)),
+            signal: request.signal,
+            // 计费同步（D4）：在 preflight 成功时即固定 reqId，后续 stream/JSON/catch/abort
+            // 全部复用它，确保 settle 的 omnirouteRequestId === call_logs.correlation_id。
+            requestId: callerCorrelationId ?? generateRequestId(),
+          };
+        }
+      }
+    }
+
     // Gate the early SSE keepalive wrapper: only wrap when the client explicitly
     // asks for streaming (body `stream: true`) or the Accept header forces SSE.
     // The parsed body is passed through UNTOUCHED — the actual stream/JSON framing
     // stays decided by chatCore/resolveStreamFlag (legacy streaming default and the
     // per-key `streamDefaultMode: "json"` opt-in are preserved).
-    const parsedBodyIsRecord = isRecord(parsedBody);
     const acceptHeader = request.headers.get("accept") || "";
     const acceptForcesStream =
       parsedBodyIsRecord && acceptHeaderForcesStream(acceptHeader, parsedBody.stream);
@@ -324,17 +380,14 @@ export async function POST(request) {
     // paths) drop the meta the docs promise.
     const compressionRequestHeader = readCompressionRequestHeader(request);
 
-    // #11739: preserve caller-provided X-Correlation-Id when present; generate only when absent.
-    const callerCorrelationId = resolveIncomingCorrelationId(
-      request.headers.get("x-correlation-id")
-    );
-
-    // Bifrost Go sidecar fast-path routing check
+    // Bifrost Go sidecar fast-path routing check.
+    // IMPORTANT: never take this path for nest-billed requests — it answers before
+    // handleChat()/withNestBilling(), which would skip settle and the call log.
     const relayBackend = resolveRelayRoutingBackend();
     const bifrostConfig = getBifrostRoutingConfig();
     let fallbackHeaderValue: string | undefined = undefined;
 
-    if (parsedBodyIsRecord && bifrostConfig) {
+    if (parsedBodyIsRecord && bifrostConfig && !nestCtx) {
       const bifrostDecision = shouldTryBifrostForRequest(relayBackend, bifrostConfig, parsedBody);
 
       if (bifrostDecision.tryBifrost) {
@@ -395,7 +448,7 @@ export async function POST(request) {
     };
 
     if (wantsStreaming) {
-      const reqId = callerCorrelationId ?? generateRequestId();
+      const reqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
       const { signal: routeDeadlineSignal, deadlineController: routeDeadlineController } =
         createStreamDeadlineSignal(request.signal);
       // Wrap the real handler response, not the synthetic early-keepalive response. If the
@@ -417,20 +470,33 @@ export async function POST(request) {
         deadlineController: routeDeadlineController,
       });
       return withCompressionHeaderEcho(
-        applyFallbackHeaders(streamedResponse),
+        applyFallbackHeaders(withNestBilling(streamedResponse, nestCtx)),
         compressionRequestHeader
       );
     }
 
+    const jsonReqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
     return finishAdmission(
       withCompressionHeaderEcho(
         applyFallbackHeaders(
-          await handleChat(request, null, parsedBody, callerCorrelationId ?? undefined)
+          withNestBilling(await handleChat(request, null, parsedBody, jsonReqId), nestCtx)
         ),
         compressionRequestHeader
       )
     );
   } catch (error) {
+    if (nestCtx) {
+      void nestSettle({
+        ticket: nestCtx.ticket,
+        status: 500,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        durationMs: Date.now() - nestCtx.startedAt,
+        error: (error as Error)?.message ?? String(error),
+        upstreamModel: nestCtx.model,
+        omnirouteRequestId: nestCtx.requestId ?? null,
+        traceId: nestCtx.requestId ?? null,
+      });
+    }
     admission.lease?.release();
     throw error;
   }

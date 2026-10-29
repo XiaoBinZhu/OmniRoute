@@ -49,6 +49,17 @@ ENV OMNIROUTE_BASE_PATH=$OMNIROUTE_BASE_PATH
 ARG DASHBOARD_ALLOW_EMBED=""
 ENV DASHBOARD_ALLOW_EMBED=$DASHBOARD_ALLOW_EMBED
 
+# API-only artifact (dashboard UI stubbed) for headless gateway hosts — same
+# contract as the Node Dockerfile: OMNIROUTE_BUILD_BACKEND_ONLY=1 drops the
+# client bundle and the prerender pass while keeping every /v1 + /api route.
+ARG OMNIROUTE_BUILD_BACKEND_ONLY=""
+ENV OMNIROUTE_BUILD_BACKEND_ONLY=$OMNIROUTE_BUILD_BACKEND_ONLY
+
+# V8 heap for scripts/build/build-next-isolated.mjs (the Next build still renders
+# on V8). Empty = the script's 8192 default.
+ARG OMNIROUTE_BUILD_MEMORY_MB=""
+ENV OMNIROUTE_BUILD_MEMORY_MB=$OMNIROUTE_BUILD_MEMORY_MB
+
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 

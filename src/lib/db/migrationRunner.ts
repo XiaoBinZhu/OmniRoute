@@ -466,6 +466,11 @@ function isSchemaAlreadyApplied(
       return hasColumn(db, "skills", "mode");
     case "028":
       return hasTable(db, "batches") && hasTable(db, "files");
+    case "215":
+      // Renumbered 213 → 214 → 215: upstream claimed 213 (api_key_preferred_connections)
+      // then 214 (call_logs_client_session_id). Databases that already applied the old
+      // 213/214 nest_billing carry the outbox table — never re-run it.
+      return hasTable(db, "nest_billing_outbox");
     case "029":
       return hasColumn(db, "provider_connections", "max_concurrent");
     case "040":
@@ -1206,7 +1211,11 @@ export function getMigrationStatus(db: SqliteAdapter): {
 
   const appliedVersions = new Set(appliedRows.map((r) => r.version));
   const allFiles = getMigrationFiles();
-  const pending = allFiles.filter((f) => !appliedVersions.has(f.version));
+  // 与 runMigrations 保持一致：已存在目标 schema 的迁移不再计为 pending
+  // （例如 nest_billing 从 213/214 改号为 215，老库已有 outbox 表）
+  const pending = allFiles.filter(
+    (f) => !appliedVersions.has(f.version) && !isSchemaAlreadyApplied(db, f)
+  );
 
   return { applied: appliedRows, pending };
 }
