@@ -11,6 +11,11 @@ export interface NestPreflightInput {
   promptTokens?: number;
   bodyDigest?: string;
   idempotencyKey?: string | null;
+  /** F16：预扣阶段 cache 四维（可选） */
+  cacheWriteTokens?: number;
+  cacheReadTokens?: number;
+  cacheWrite1hTokens?: number;
+  promptIncludesCache?: boolean;
 }
 
 export type NestPreflightResult =
@@ -74,7 +79,7 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
         JSON.stringify({
           model: input.model,
           stream: input.stream,
-          maxTokens: input.maxTokens ?? 1,
+          maxTokens: input.maxTokens ?? 4096,
         })
       )
       .digest("hex");
@@ -89,9 +94,14 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
       body: JSON.stringify({
         model: input.model,
         stream: input.stream,
-        maxTokens: input.maxTokens ?? 1,
+        // F15：未声明 max_tokens 时按 4096 估算，避免预扣被低估
+        maxTokens: input.maxTokens ?? 4096,
         promptTokens: input.promptTokens ?? 0,
         bodyDigest,
+        cacheWriteTokens: input.cacheWriteTokens ?? 0,
+        cacheReadTokens: input.cacheReadTokens ?? 0,
+        cacheWrite1hTokens: input.cacheWrite1hTokens ?? 0,
+        promptIncludesCache: input.promptIncludesCache === true,
       }),
       signal: timeoutSignal(timeoutMs),
     });
@@ -172,7 +182,7 @@ export async function nestSettle(input: NestSettleInput): Promise<{ ok: boolean;
   return { ok: false, error: lastError };
 }
 
-/** Durable replay queue (SQLite, migration 213). Failure here must never break the response. */
+/** Durable replay queue (SQLite, migration 215). Failure here must never break the response. */
 export function enqueueOutbox(ticket: string, payload: string, lastError: string): void {
   try {
     const db = getDbInstance();

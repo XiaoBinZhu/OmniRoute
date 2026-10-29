@@ -118,8 +118,13 @@ export function withNestBilling(response: Response, ctx: NestBillingContext | nu
     status: response.status,
     error: response.ok ? null : `upstream HTTP ${response.status}`,
     aborted: false,
+    // 计费同步（D4）：优先使用路由层生成的 reqId（= call_logs.correlation_id），
+    // 上游响应头只作兜底，避免 settle 键与调用日志错位。
     requestId:
-      response.headers.get("x-request-id") ?? response.headers.get("x-correlation-id") ?? null,
+      ctx.requestId ??
+      response.headers.get("x-request-id") ??
+      response.headers.get("x-correlation-id") ??
+      null,
   };
 
   // Client cancellations should still settle against what was consumed.
