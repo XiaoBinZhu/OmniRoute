@@ -592,6 +592,13 @@ export async function registerNodejs(): Promise<void> {
     ),
   ]);
 
+  // T1.1 / N4 / N9: nest billing must fail fast on a half-working configuration
+  // (empty NEST_EDGE_SECRET = preflight ok but settle silently dropped; a
+  // self-hosted divert answers before the preflight and bypasses billing).
+  await import("@/lib/nestBilling/startupAssertions").then(({ enforceNestBillingRuntimeEnv }) =>
+    enforceNestBillingRuntimeEnv()
+  );
+
   // Clear stale transient connection cooldowns persisted from an unclean crash.
   // A crash mid-burst can leave far-future `rate_limited_until` values in the DB
   // that cause every connection to be skipped by getProviderCredentials(), making

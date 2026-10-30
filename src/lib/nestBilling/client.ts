@@ -19,8 +19,17 @@ export interface NestPreflightInput {
 }
 
 export type NestPreflightResult =
-  | { ok: true; ticket: string; userId?: number; tokenId?: number }
-  | { ok: false; status: number; message: string; code?: string };
+  | { ok: true; ticket: string; userId?: number; tokenId?: number; billingRequestId?: string }
+  | {
+      ok: false;
+      status: number;
+      message: string;
+      code?: string;
+      /** T1.4 契约：nest 的稳定业务码（insufficient_balance / invalid_token …） */
+      reason?: string;
+      /** 429 限流类：透过 nest 的 Retry-After */
+      retryAfterSeconds?: number;
+    };
 
 export interface NestSettleInput {
   ticket: string;
@@ -68,7 +77,8 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
       ok: false,
       status: 503,
       message: "Nest billing is disabled",
-      code: "nest_billing_disabled",
+      code: "billing_unavailable",
+      reason: "billing_unavailable",
     };
   }
   const { baseUrl, timeoutMs } = nestBillingConfig();
@@ -107,12 +117,22 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
     });
     const envelope = await readEnvelope(response);
     if (!response.ok) {
-      const message = String(envelope?.message ?? `nest preflight failed (${response.status})`);
+      // T1.4：优先读固定线格式的 reason；旧版 nest 只有 code（字符串时当 reason 用）
+      const rawReason = envelope?.reason ?? envelope?.code;
+      const reason =
+        typeof rawReason === "string" && rawReason.trim() ? rawReason.trim() : undefined;
+      const rawMessage = typeof envelope?.message === "string" ? envelope.message.trim() : "";
+      // 旧格式会把业务码写成 `insufficient_balance: xxx` 前缀，取前缀兼容
+      const prefixReason = /^([a-z_]+):/.exec(rawMessage)?.[1];
+      const retryAfterHeader = Number(response.headers.get("retry-after") ?? "");
       return {
         ok: false,
         status: response.status,
-        message,
-        code: envelope?.code ? String(envelope.code) : undefined,
+        message: rawMessage || `nest preflight failed (${response.status})`,
+        code: reason ?? (envelope?.code ? String(envelope.code) : undefined),
+        reason: reason ?? prefixReason,
+        retryAfterSeconds:
+          Number.isFinite(retryAfterHeader) && retryAfterHeader > 0 ? retryAfterHeader : undefined,
       };
     }
     const payload = envelope?.data ?? envelope;
@@ -120,18 +140,21 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
     if (typeof ticket !== "string" || !ticket) {
       return {
         ok: false,
-        status: 502,
+        status: 503,
         message: "nest preflight returned no ticket",
-        code: "nest_no_ticket",
+        code: "billing_unavailable",
+        reason: "billing_unavailable",
       };
     }
     return { ok: true, ticket, userId: payload?.userId, tokenId: payload?.tokenId };
   } catch (error) {
+    // N15：nest 不可达/超时 → 503 billing_unavailable（客户端可重试），不是 502
     return {
       ok: false,
-      status: 502,
+      status: 503,
       message: `nest preflight unavailable: ${(error as Error)?.message ?? error}`,
-      code: "nest_unavailable",
+      code: "billing_unavailable",
+      reason: "billing_unavailable",
     };
   }
 }
