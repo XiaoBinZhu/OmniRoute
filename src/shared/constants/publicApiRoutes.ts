@@ -58,6 +58,10 @@ const PUBLIC_API_ROUTES_EXACT = new Set([
   // collect/chaos/route.ts. Do not widen it to other /api/skills/collect/*
   // routes without the same per-handler auth.
   "/api/skills/collect/chaos",
+  // T2.1: internal outbox status for nest reconciliation. The handler enforces
+  // its own auth: `x-edge-secret` compared timing-safe against NEST_EDGE_SECRET
+  // (401 otherwise). EXACT path, read-only counts only.
+  "/api/internal/nest/outbox-status",
 ]);
 
 // Read-only single routes that ALSO take the CORS origin relaxation: they
