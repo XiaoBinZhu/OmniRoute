@@ -119,6 +119,40 @@ jobs:
           git remote add origin https://github.com/diegosouzapw/OmniRoute.git
       - name: 同步 upstream → main + dev
         run: node scripts/dev/sync-upstream.mjs
+
+      # T6.8 / F6：上游合并可能改坏 chat/messages 路由里的 nest 计费钩子。
+      # 推 proc 前先跑计费契约测试，不过则不推进 proc（deploy-proc 也不会被触发）。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies (billing contract)
+        run: npm ci --ignore-scripts
+
+      - name: 计费契约静态断言
+        run: |
+          set -euo pipefail
+          grep -qE "withNestBilling|runNestPreflight|preflightWithCandidates" src/app/api/v1/chat/completions/route.ts \
+            || { echo "::error::chat route lost its nest billing hook"; exit 1; }
+          grep -q "NEST_BILLED_ENDPOINTS" src/lib/nestBilling/credentials.ts \
+            || { echo "::error::credentials whitelist missing"; exit 1; }
+          grep -q "startNestBillingOutboxWorker" src/instrumentation-node.ts \
+            || { echo "::error::outbox worker not started"; exit 1; }
+
+      - name: 计费契约单测
+        run: |
+          set -euo pipefail
+          node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts \
+            --test --test-force-exit \
+            tests/unit/nest-billing.test.ts \
+            tests/unit/nest-billing-sync.test.ts \
+            tests/unit/nest-credentials.test.ts \
+            tests/unit/nest-billing-errors.test.ts \
+            tests/unit/nest-billing-usage.test.ts \
+            tests/unit/nest-billing-cost.test.ts \
+            tests/unit/nest-billing-outbox.test.ts
+
       - name: 合并 dev → proc
         run: node scripts/ops/promote-proc.mjs
       # push proc 由 PAT 触发 deploy-proc 的 push 事件；deploy-proc 已把 push 路径的
