@@ -151,11 +151,16 @@ async function settleOnce(ctx: NestBillingContext, state: SettleState): Promise<
   let upstreamCost = state.upstreamCost;
   if (upstreamCost == null && state.upstreamProvider) {
     try {
+      // 口径适配：costCalculator 内部会从 input 里扣除 cacheRead/cacheWrite（OpenAI 口径）。
+      // Claude 的 input_tokens **不包含**缓存 → 若直接传 promptTokens 会把输入成本扣成负数。
+      const inputForCost = usage.promptIncludesCache
+        ? usage.promptTokens
+        : usage.promptTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
       const detailed = await calculateCostDetailed(
         state.upstreamProvider,
         state.upstreamModel ?? ctx.model,
         {
-          input: usage.promptTokens,
+          input: inputForCost,
           output: usage.completionTokens,
           cached_tokens: usage.cacheReadTokens,
           cache_creation_input_tokens: usage.cacheWriteTokens,

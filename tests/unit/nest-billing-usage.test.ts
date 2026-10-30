@@ -270,6 +270,18 @@ test("#11 2MB base64 图片：预扣估算 ≤ 文本估算 + 1500", () => {
   };
   const estimate = estimatePromptTokens(body);
   assert.ok(estimate <= 2000 + IMAGE_TOKEN_ESTIMATE, `estimate=${estimate}`);
+  // 同一张图不得因“图片块 + data URI 字符串”被重复计数
+  assert.ok(estimate < 2000 + IMAGE_TOKEN_ESTIMATE * 2, `estimate=${estimate}`);
+});
+
+test("#11b OpenAI image_url data URI 也只计一张图", () => {
+  const image = `data:image/png;base64,${"B".repeat(500_000)}`;
+  const body = {
+    messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: image } }] }],
+  };
+  const estimate = estimatePromptTokens(body);
+  assert.ok(estimate >= IMAGE_TOKEN_ESTIMATE, `estimate=${estimate}`);
+  assert.ok(estimate < IMAGE_TOKEN_ESTIMATE * 2 + 200, `estimate=${estimate}`);
 });
 
 test("#12 total_tokens = prompt + completion（不取 max）", () => {

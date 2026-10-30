@@ -16,7 +16,6 @@
 
 import { isNestBillingEnabled } from "./config";
 import { getNestBillingOutboxStatus, replayNestBillingOutbox } from "./client";
-
 const TICK_MS = 30_000;
 const PAUSE_ON_UNAUTHORIZED_MS = 5 * 60_000;
 
@@ -36,6 +35,8 @@ export function isOutboxWorkerEnabled(env: NodeJS.ProcessEnv = process.env): boo
 export async function runOutboxTick(now = Date.now()): Promise<void> {
   if (running) return;
   if (now < pausedUntil) return;
+  // 运行期也要尊重“关闭后台服务”（测试/排障时可能热设）
+  if (!isNestBillingEnabled()) return;
   running = true;
   try {
     const outcome = await replayNestBillingOutbox(50);

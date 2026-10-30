@@ -33,15 +33,16 @@ type StripResult = { value: unknown; images: number };
 export function stripBinaryPayloads(input: unknown): StripResult {
   let images = 0;
 
-  const walk = (value: unknown): unknown => {
+  /** `insideImage`：已由图片块计入的子树，**不再**把其中的 data URI 字符串重复计一张图 */
+  const walk = (value: unknown, insideImage = false): unknown => {
     if (typeof value === "string") {
       if (looksLikeBase64Payload(value)) {
-        images += 1;
+        if (!insideImage) images += 1;
         return "";
       }
       return value;
     }
-    if (Array.isArray(value)) return value.map(walk);
+    if (Array.isArray(value)) return value.map((item) => walk(item, insideImage));
     if (typeof value !== "object" || value === null) return value;
 
     const record = value as Record<string, unknown>;
@@ -50,11 +51,11 @@ export function stripBinaryPayloads(input: unknown): StripResult {
       record.type === "input_image" ||
       typeof record.image_url === "string" ||
       (typeof record.image_url === "object" && record.image_url !== null);
+    if (isImageBlock && !insideImage) images += 1;
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(record)) {
-      out[key] = walk(item);
+      out[key] = walk(item, insideImage || isImageBlock);
     }
-    if (isImageBlock) images += 1;
     return out;
   };
 
