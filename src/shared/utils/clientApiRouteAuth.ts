@@ -24,11 +24,12 @@ import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
 import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
 import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth";
+import { isNestBillingEnabled } from "@/lib/nestBilling/config";
 import {
-  isNestBillingChatPath,
-  isNestBillingEnabled,
-  isNestBillingKeyCandidate,
-} from "@/lib/nestBilling/config";
+  nestBilledEndpoint,
+  nestCredentialCandidates,
+  nestVerifyOnlyEndpoint,
+} from "@/lib/nestBilling/credentials";
 
 /**
  * Authenticate a client-API request at the route level.
@@ -43,14 +44,13 @@ export async function enforceClientApiRouteAuth(request: Request): Promise<Respo
   const { apiKey: apiKeyRaw, valid } = await resolveClientApiKey(request);
 
   if (valid) return null;
-  // Nest tokens are validated by the chat route preflight (D3); other routes
-  // still reject them because only the chat completions path is deferred.
-  if (
-    isNestBillingEnabled() &&
-    isNestBillingChatPath(request.url) &&
-    isNestBillingKeyCandidate(apiKeyRaw)
-  ) {
-    return null;
+  // Nest credentials (`sk-` tokens / C-end JWT) are validated by the endpoint's
+  // own preflight (D3), which is the only place that can create a billing hold.
+  // Evaluate EVERY presented credential (N6): a stale `Bearer sk-ant-…` next to a
+  // valid `x-api-key: sk-nest…` must not 401 here.
+  if (isNestBillingEnabled()) {
+    const nestEndpoint = nestBilledEndpoint(request.url) ?? nestVerifyOnlyEndpoint(request.url);
+    if (nestEndpoint && nestCredentialCandidates(request).length > 0) return null;
   }
   if (apiKeyRaw) {
     return isRequireApiKeyEnabled()

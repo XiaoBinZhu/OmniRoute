@@ -1,11 +1,12 @@
 import { isDashboardSessionAuthenticated } from "@/shared/utils/apiAuth.ts";
 import { isRequireApiKeyEnabled } from "@/shared/utils/featureFlags";
 import { extractApiKeyCandidates } from "@/sse/services/clientApiKeyResolver.ts";
+import { isNestBillingEnabled } from "@/lib/nestBilling/config";
 import {
-  isNestBillingChatPath,
-  isNestBillingEnabled,
   isNestBillingKeyCandidate,
-} from "@/lib/nestBilling/config";
+  nestBilledEndpoint,
+  nestVerifyOnlyEndpoint,
+} from "@/lib/nestBilling/credentials";
 import type { AuthOutcome, PolicyContext, RoutePolicy } from "../context";
 import { allow, reject } from "../context";
 
@@ -67,14 +68,16 @@ export const clientApiPolicy: RoutePolicy = {
       }
     }
 
-    // Nest tokens (`sk-`, 43 direct path) are validated by the chat route
-    // preflight, which is the only place that can create a billing hold.
-    if (
-      isNestBillingEnabled() &&
-      isNestBillingChatPath(ctx.request.url) &&
-      credentials.some(isNestBillingKeyCandidate)
-    ) {
-      return allow({ kind: "nest_token_pending", id: maskKeyId(credentials[0]) });
+    // Nest credentials (`sk-` tokens / C-end JWT, 43 direct path) are validated
+    // by the endpoint preflight, which is the only place that can create a
+    // billing hold. Phase 1 covers chat; T3.3 adds the verify-only count_tokens
+    // route so Claude Code can count tokens without a hold.
+    if (isNestBillingEnabled()) {
+      const nestEndpoint =
+        nestBilledEndpoint(ctx.request.url) ?? nestVerifyOnlyEndpoint(ctx.request.url);
+      if (nestEndpoint && credentials.some(isNestBillingKeyCandidate)) {
+        return allow({ kind: "nest_token_pending", id: maskKeyId(credentials[0]) });
+      }
     }
 
     // Issue #2257: when REQUIRE_API_KEY is off, a stale CLI config (Codex

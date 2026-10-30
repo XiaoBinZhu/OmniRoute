@@ -45,16 +45,16 @@ import {
   isCommonChatGptWebRetirementError,
 } from "@/shared/constants/chatgptWebRetirement";
 import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
-import { extractApiKeyCandidates, resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
+import { resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
 import {
   isNestBillingEnabled,
-  isNestBillingKeyCandidate,
   nestBillingErrorResponse,
-  nestPreflight,
+  nestCredentialCandidates,
   nestSettle,
   withNestBilling,
   type NestBillingContext,
 } from "@/lib/nestBilling";
+import { nestPreflightShapeRejection, preflightWithCandidates } from "@/lib/nestBilling/preflight";
 import {
   getBifrostRoutingConfig,
   resolveRelayRoutingBackend,
@@ -328,24 +328,42 @@ export async function POST(request) {
       request.headers.get("x-correlation-id")
     );
 
-    // D2/D3: nest preflight for `sk-` tokens (43 direct path). OmniRoute keys win
-    // when they validate, so local keys keep their existing behaviour.
+    // D2/D3: nest preflight for nest credentials (`sk-` tokens or C-end JWT, 43
+    // direct path). OmniRoute keys win when they validate, so local keys keep
+    // their existing behaviour.
     const parsedBodyIsRecord = isRecord(parsedBody);
-    if (isNestBillingEnabled() && parsedBodyIsRecord && requestedModel) {
-      const credential = extractApiKeyCandidates(request).find(isNestBillingKeyCandidate) ?? null;
-      if (credential) {
+    // T1.1/N4: any nest credential that did NOT pass a preflight must be rejected
+    // before handleChat — a missing model or a non-object body must never reach
+    // the upstream unbilled (fail-closed).
+    const billingModel =
+      requestedModel ||
+      (parsedBodyIsRecord && typeof parsedBody.model === "string" ? parsedBody.model.trim() : "");
+    if (isNestBillingEnabled()) {
+      const nestCandidates = nestCredentialCandidates(request);
+      if (nestCandidates.length > 0) {
         const localKey = await resolveClientApiKey(request).catch(() => ({ valid: false }));
         if (!localKey.valid) {
+          // N4：body 不是对象 / 没有 model 时直接 400，绝不进 handleChat。
+          const shapeRejection = nestPreflightShapeRejection({
+            parsedBodyIsRecord,
+            model: billingModel,
+          });
+          if (shapeRejection) {
+            return finishAdmission(errorResponse(shapeRejection.status, shapeRejection.message));
+          }
           const bodyText = JSON.stringify(parsedBody);
-          const preflight = await nestPreflight({
-            key: credential,
-            model: requestedModel,
+          const promptTokensEstimate = Math.max(1, Math.ceil(bodyText.length / 4));
+          const bodyDigest = createHash("sha256").update(bodyText).digest("hex");
+          // 逐个尝试候选：只有 401（令牌无效）才换下一个（陈旧 Bearer + 有效
+          // x-api-key 的 Claude Code 场景）；402/403/404/429/5xx 直接透传。
+          const preflight = await preflightWithCandidates(nestCandidates, {
+            model: billingModel,
             stream: parsedBody.stream === true,
             // F15：未声明 max_tokens 时按 4096 估算，避免预扣被低估
             maxTokens:
               Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 4096) || 4096,
-            promptTokens: Math.max(1, Math.ceil(bodyText.length / 4)),
-            bodyDigest: createHash("sha256").update(bodyText).digest("hex"),
+            promptTokens: promptTokensEstimate,
+            bodyDigest,
             idempotencyKey: request.headers.get("x-idempotency-key"),
           });
           if (!preflight.ok) {
@@ -354,8 +372,8 @@ export async function POST(request) {
           nestCtx = {
             ticket: preflight.ticket,
             startedAt: Date.now(),
-            model: requestedModel,
-            promptTokensEstimate: Math.max(1, Math.ceil(bodyText.length / 4)),
+            model: billingModel,
+            promptTokensEstimate,
             signal: request.signal,
             // 计费同步（D4）：在 preflight 成功时即固定 reqId，后续 stream/JSON/catch/abort
             // 全部复用它，确保 settle 的 omnirouteRequestId === call_logs.correlation_id。
