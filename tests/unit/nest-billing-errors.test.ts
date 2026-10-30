@@ -139,6 +139,39 @@ test("nest 返回固定线格式 reason → preflight 结果保留 reason 与 Re
   }
 });
 
+test("嵌套响应头：T2.2 透传 x-real-ip 给 nest", async () => {
+  const original = globalThis.fetch;
+  const previousEnabled = process.env.NEST_BILLING_ENABLED;
+  const previousBase = process.env.NEST_BILLING_BASE_URL;
+  const seen: Record<string, string> = {};
+  process.env.NEST_BILLING_ENABLED = "1";
+  process.env.NEST_BILLING_BASE_URL = "http://nest.local";
+  try {
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      seen["x-real-ip"] = headers.get("x-real-ip") ?? "";
+      return new Response(JSON.stringify({ ticket: "t-ip" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof globalThis.fetch;
+    const ok = await nestPreflight({
+      key: "sk-x",
+      model: "m",
+      stream: false,
+      clientIp: "203.0.113.9",
+    });
+    assert.equal(ok.ok, true);
+    assert.equal(seen["x-real-ip"], "203.0.113.9");
+  } finally {
+    globalThis.fetch = original;
+    if (previousEnabled === undefined) delete process.env.NEST_BILLING_ENABLED;
+    else process.env.NEST_BILLING_ENABLED = previousEnabled;
+    if (previousBase === undefined) delete process.env.NEST_BILLING_BASE_URL;
+    else process.env.NEST_BILLING_BASE_URL = previousBase;
+  }
+});
+
 afterEach(() => {
   delete process.env.NEST_BILLING_ENABLED;
 });

@@ -55,6 +55,8 @@ import {
   type NestBillingContext,
 } from "@/lib/nestBilling";
 import { nestPreflightShapeRejection, preflightWithCandidates } from "@/lib/nestBilling/preflight";
+import { estimatePromptTokens } from "@/lib/nestBilling/estimate";
+import { nestBilledEndpoint } from "@/lib/nestBilling/credentials";
 import {
   getBifrostRoutingConfig,
   resolveRelayRoutingBackend,
@@ -352,7 +354,8 @@ export async function POST(request) {
             return finishAdmission(errorResponse(shapeRejection.status, shapeRejection.message));
           }
           const bodyText = JSON.stringify(parsedBody);
-          const promptTokensEstimate = Math.max(1, Math.ceil(bodyText.length / 4));
+          // T2.3/N12：图片/base64 不再计入文本估算（否则图生图/视觉请求预扣天价）
+          const promptTokensEstimate = estimatePromptTokens(parsedBody);
           const bodyDigest = createHash("sha256").update(bodyText).digest("hex");
           // 逐个尝试候选：只有 401（令牌无效）才换下一个（陈旧 Bearer + 有效
           // x-api-key 的 Claude Code 场景）；402/403/404/429/5xx 直接透传。
@@ -365,6 +368,8 @@ export async function POST(request) {
             promptTokens: promptTokensEstimate,
             bodyDigest,
             idempotencyKey: request.headers.get("x-idempotency-key"),
+            // T2.2：宿主 nginx 已用 real_ip 写真实客户端 IP，这里原样透传给 nest
+            clientIp: request.headers.get("x-real-ip"),
           });
           if (!preflight.ok) {
             return finishAdmission(nestBillingErrorResponse(preflight));
@@ -378,6 +383,10 @@ export async function POST(request) {
             // 计费同步（D4）：在 preflight 成功时即固定 reqId，后续 stream/JSON/catch/abort
             // 全部复用它，确保 settle 的 omnirouteRequestId === call_logs.correlation_id。
             requestId: callerCorrelationId ?? generateRequestId(),
+            // T2.1：幂等键回传，供 ticket 过期后的迟到结算定位预扣会话
+            billingRequestId: preflight.billingRequestId ?? null,
+            // T3.4：端点随 ticket 写入日志
+            endpoint: nestBilledEndpoint(request.url) ?? "/v1/chat/completions",
           };
         }
       }

@@ -11,6 +11,8 @@ export interface NestPreflightInput {
   promptTokens?: number;
   bodyDigest?: string;
   idempotencyKey?: string | null;
+  /** T2.2：客户端真实 IP（宿主 nginx 注入的 `x-real-ip`），供 nest 做令牌 IP 白/黑名单 */
+  clientIp?: string | null;
   /** F16：预扣阶段 cache 四维（可选） */
   cacheWriteTokens?: number;
   cacheReadTokens?: number;
@@ -41,6 +43,8 @@ export interface NestSettleInput {
     cacheWriteTokens?: number;
     cacheReadTokens?: number;
     cacheWrite1hTokens?: number;
+    /** T2.3：true = promptTokens 已包含缓存，nest 计价需先扣除 cacheRead */
+    promptIncludesCache?: boolean;
   };
   durationMs: number;
   aborted?: boolean;
@@ -50,6 +54,14 @@ export interface NestSettleInput {
   upstreamCost?: number | null;
   omnirouteRequestId?: string | null;
   traceId?: string | null;
+  /** T2.1：预检返回的幂等键（ticket 过期后 nest 用它在会话表定位预扣） */
+  billingRequestId?: string | null;
+  /** T2.3：用量来源（upstream_usage / estimated / estimated_abort） */
+  usageProvenance?: string | null;
+  /** T3.4：规范化端点（/v1/chat/completions 等） */
+  endpoint?: string | null;
+  /** T2.1：请求模型（迟到结算时 ticket 已过期，nest 需要它重新计价） */
+  model?: string | null;
 }
 
 function timeoutSignal(ms: number): AbortSignal {
@@ -82,6 +94,9 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
     };
   }
   const { baseUrl, timeoutMs } = nestBillingConfig();
+  // T2.1/N8：幂等键必须能回传——客户端没带时用本地生成的 UUID，
+  // 并随 settle 的 billingRequestId 传回，否则 ticket 过期后无法定位预扣会话。
+  const sentIdempotencyKey = input.idempotencyKey?.trim() || randomUUID();
   const bodyDigest =
     input.bodyDigest ??
     createHash("sha256")
@@ -99,7 +114,9 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${input.key}`,
-        "x-idempotency-key": input.idempotencyKey ?? randomUUID(),
+        "x-idempotency-key": sentIdempotencyKey,
+        // T2.2：透传客户端 IP（不传时 nest 用 socket 对端，白名单令牌会被误判）
+        ...(input.clientIp ? { "x-real-ip": input.clientIp } : {}),
       },
       body: JSON.stringify({
         model: input.model,
@@ -146,7 +163,18 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
         reason: "billing_unavailable",
       };
     }
-    return { ok: true, ticket, userId: payload?.userId, tokenId: payload?.tokenId };
+    return {
+      ok: true,
+      ticket,
+      userId: payload?.userId,
+      tokenId: payload?.tokenId,
+      // T2.1/N8：nest 预检返回的幂等键（＝写入 billing_session 的 requestId）；
+      // 缺失时（旧版 nest）回退到本地发送的 x-idempotency-key。
+      billingRequestId:
+        typeof payload?.billingRequestId === "string" && payload.billingRequestId
+          ? payload.billingRequestId
+          : sentIdempotencyKey,
+    };
   } catch (error) {
     // N15：nest 不可达/超时 → 503 billing_unavailable（客户端可重试），不是 502
     return {
@@ -178,9 +206,15 @@ export async function nestSettle(input: NestSettleInput): Promise<{ ok: boolean;
     upstreamCost: input.upstreamCost ?? undefined,
     omnirouteRequestId: input.omnirouteRequestId ?? undefined,
     traceId: input.traceId ?? undefined,
+    // T2.1/T2.3/T3.4：迟到结算定位键、用量来源、端点、模型
+    billingRequestId: input.billingRequestId ?? undefined,
+    usageProvenance: input.usageProvenance ?? undefined,
+    endpoint: input.endpoint ?? undefined,
+    model: input.model ?? undefined,
   });
 
   let lastError = "";
+  let lastStatus: number | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const response = await fetch(`${baseUrl}/ai/edge/settle`, {
@@ -194,49 +228,92 @@ export async function nestSettle(input: NestSettleInput): Promise<{ ok: boolean;
       });
       if (response.ok) return { ok: true };
       lastError = `settle HTTP ${response.status}`;
+      lastStatus = response.status;
       if (response.status < 500) break;
     } catch (error) {
       lastError = (error as Error)?.message ?? String(error);
+      lastStatus = null;
     }
     await new Promise((resolve) => setTimeout(resolve, 250 * Math.pow(3, attempt)));
   }
 
-  enqueueOutbox(input.ticket, body, lastError);
+  enqueueOutbox(input.ticket, body, lastError, lastStatus);
   return { ok: false, error: lastError };
 }
 
-/** Durable replay queue (SQLite, migration 215). Failure here must never break the response. */
-export function enqueueOutbox(ticket: string, payload: string, lastError: string): void {
+/** outbox 重试上限：超过则置 dead（需人工介入，不再无休止重试） */
+export const OUTBOX_MAX_ATTEMPTS = 50;
+/** 首次退避 */
+const OUTBOX_BASE_DELAY_MS = 30_000;
+/** 最大退避 */
+const OUTBOX_MAX_DELAY_MS = 60 * 60 * 1000;
+
+function outboxBackoffMs(attempts: number): number {
+  const exponent = Math.max(0, attempts - 1);
+  return Math.min(OUTBOX_MAX_DELAY_MS, OUTBOX_BASE_DELAY_MS * Math.pow(2, exponent));
+}
+
+/** Durable replay queue (SQLite, migration 215/216). Failure here must never break the response. */
+export function enqueueOutbox(
+  ticket: string,
+  payload: string,
+  lastError: string,
+  lastStatus?: number | null
+): void {
   try {
     const db = getDbInstance();
+    const now = Date.now();
     db.prepare(
-      `INSERT INTO nest_billing_outbox (id, created_at, ticket, payload, attempts, last_error, status)
-       VALUES (@id, @createdAt, @ticket, @payload, 0, @lastError, 'pending')`
+      `INSERT INTO nest_billing_outbox
+         (id, created_at, ticket, payload, attempts, last_error, status, next_attempt_at, last_status)
+       VALUES (@id, @createdAt, @ticket, @payload, 0, @lastError, 'pending', @nextAttemptAt, @lastStatus)`
     ).run({
       id: randomUUID(),
-      createdAt: new Date().toISOString(),
+      createdAt: new Date(now).toISOString(),
       ticket,
       payload,
       lastError: String(lastError ?? "").slice(0, 1000),
+      nextAttemptAt: new Date(now + OUTBOX_BASE_DELAY_MS).toISOString(),
+      lastStatus: lastStatus ?? null,
     });
   } catch (error) {
     console.error("[nestBilling] outbox insert failed:", (error as Error)?.message ?? error);
   }
 }
 
-/** Best-effort replay used by maintenance jobs/tests; safe to call repeatedly. */
-export async function replayNestBillingOutbox(limit = 20): Promise<number> {
-  if (!isNestBillingEnabled()) return 0;
+export interface OutboxReplayOutcome {
+  sent: number;
+  retried: number;
+  dead: number;
+  /** 401（共享密钥不一致）：配置错误，worker 应暂停并告警 */
+  unauthorized: boolean;
+}
+
+/**
+ * 回放到期行（T2.1）。分类语义：
+ * - 2xx → sent
+ * - 401 → 暂停整个 worker（配置错误，重试无意义）
+ * - 400/402 → dead（数据/额度问题，重试只会刷日志）
+ * - 409/5xx/网络 → 指数退避重试；attempts 达上限置 dead
+ */
+export async function replayNestBillingOutbox(limit = 20): Promise<OutboxReplayOutcome> {
+  const outcome: OutboxReplayOutcome = { sent: 0, retried: 0, dead: 0, unauthorized: false };
+  if (!isNestBillingEnabled()) return outcome;
   const { baseUrl, edgeSecret, timeoutMs } = nestBillingConfig();
-  if (!edgeSecret) return 0;
+  if (!edgeSecret) return outcome;
   const db = getDbInstance();
+  const nowIso = new Date().toISOString();
   const rows = db
     .prepare(
-      `SELECT id, payload FROM nest_billing_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?`
+      `SELECT id, payload, attempts FROM nest_billing_outbox
+       WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       ORDER BY created_at ASC LIMIT ?`
     )
-    .all(limit) as Array<{ id: string; payload: string }>;
-  let replayed = 0;
+    .all(nowIso, limit) as Array<{ id: string; payload: string; attempts: number }>;
+
   for (const row of rows) {
+    let status = 0;
+    let errorText = "";
     try {
       const response = await fetch(`${baseUrl}/ai/edge/settle`, {
         method: "POST",
@@ -244,21 +321,93 @@ export async function replayNestBillingOutbox(limit = 20): Promise<number> {
         body: row.payload,
         signal: timeoutSignal(timeoutMs),
       });
-      if (response.ok) {
-        db.prepare(
-          `UPDATE nest_billing_outbox SET status = 'sent', attempts = attempts + 1 WHERE id = ?`
-        ).run(row.id);
-        replayed += 1;
-      } else {
-        db.prepare(`UPDATE nest_billing_outbox SET attempts = attempts + 1 WHERE id = ?`).run(
-          row.id
-        );
-      }
+      status = response.status;
     } catch (error) {
-      db.prepare(
-        `UPDATE nest_billing_outbox SET attempts = attempts + 1, last_error = ? WHERE id = ?`
-      ).run(String((error as Error)?.message ?? error).slice(0, 1000), row.id);
+      status = 0;
+      errorText = String((error as Error)?.message ?? error);
     }
+
+    const attempts = row.attempts + 1;
+    if (status >= 200 && status < 300) {
+      db.prepare(
+        `UPDATE nest_billing_outbox SET status = 'sent', attempts = ?, last_status = ? WHERE id = ?`
+      ).run(attempts, status, row.id);
+      outcome.sent += 1;
+      continue;
+    }
+
+    if (status === 401) {
+      // 不消耗 attempts：配置修好后应能立即回放
+      db.prepare(`UPDATE nest_billing_outbox SET last_status = ?, last_error = ? WHERE id = ?`).run(
+        status,
+        "401 invalid edge secret",
+        row.id
+      );
+      outcome.unauthorized = true;
+      break;
+    }
+
+    if (status === 400 || status === 402) {
+      db.prepare(
+        `UPDATE nest_billing_outbox SET status = 'dead', attempts = ?, last_status = ?, last_error = ? WHERE id = ?`
+      ).run(attempts, status, `HTTP ${status} (dead)`, row.id);
+      outcome.dead += 1;
+      continue;
+    }
+
+    if (attempts >= OUTBOX_MAX_ATTEMPTS) {
+      db.prepare(
+        `UPDATE nest_billing_outbox SET status = 'dead', attempts = ?, last_status = ?, last_error = ? WHERE id = ?`
+      ).run(
+        attempts,
+        status || null,
+        `max attempts reached (${errorText || `HTTP ${status}`})`,
+        row.id
+      );
+      outcome.dead += 1;
+      continue;
+    }
+
+    db.prepare(
+      `UPDATE nest_billing_outbox
+         SET attempts = ?, last_status = ?, last_error = ?, next_attempt_at = ?
+       WHERE id = ?`
+    ).run(
+      attempts,
+      status || null,
+      (errorText || `HTTP ${status}`).slice(0, 1000),
+      new Date(Date.now() + outboxBackoffMs(attempts)).toISOString(),
+      row.id
+    );
+    outcome.retried += 1;
   }
-  return replayed;
+
+  return outcome;
+}
+
+/** 只读状态（供 `/api/internal/nest/outbox-status` 与对账页） */
+export function getNestBillingOutboxStatus(): {
+  pending: number;
+  dead: number;
+  sent: number;
+  oldestPendingAt: string | null;
+} {
+  try {
+    const db = getDbInstance();
+    const rows = db
+      .prepare(`SELECT status, COUNT(*) AS c FROM nest_billing_outbox GROUP BY status`)
+      .all() as Array<{ status: string; c: number }>;
+    const byStatus = Object.fromEntries(rows.map((row) => [row.status, Number(row.c)]));
+    const oldest = db
+      .prepare(`SELECT MIN(created_at) AS oldest FROM nest_billing_outbox WHERE status = 'pending'`)
+      .get() as { oldest?: string | null } | undefined;
+    return {
+      pending: byStatus.pending ?? 0,
+      dead: byStatus.dead ?? 0,
+      sent: byStatus.sent ?? 0,
+      oldestPendingAt: oldest?.oldest ?? null,
+    };
+  } catch {
+    return { pending: 0, dead: 0, sent: 0, oldestPendingAt: null };
+  }
 }

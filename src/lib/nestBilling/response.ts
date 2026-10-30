@@ -1,6 +1,11 @@
 import { CORS_HEADERS } from "@/shared/utils/cors";
 
+import { countTextTokens, type TokenizerContext } from "@/shared/utils/tiktokenCounter";
+import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
+import { calculateCostDetailed } from "@/lib/usage/costCalculator";
+
 import { nestSettle, type NestPreflightResult } from "./client";
+import { UsageAccumulator } from "./usageAccumulator";
 
 export interface NestBillingContext {
   ticket: string;
@@ -9,6 +14,10 @@ export interface NestBillingContext {
   promptTokensEstimate: number;
   signal?: AbortSignal;
   requestId?: string | null;
+  /** T2.1：预检返回的幂等键（ticket 过期后 nest 用它定位预扣会话） */
+  billingRequestId?: string | null;
+  /** T3.4：规范化端点（/v1/chat/completions → nest 日志与令牌白名单） */
+  endpoint?: string;
 }
 
 export interface ParsedUsage {
@@ -18,58 +27,36 @@ export interface ParsedUsage {
   cacheWriteTokens: number;
   cacheReadTokens: number;
   cacheWrite1hTokens: number;
+  promptIncludesCache?: boolean;
 }
 
-function num(value: unknown): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
-}
-
-/** Parse the many usage shapes emitted by OpenAI/Anthropic-compatible providers. */
+/**
+ * 单事件解析（兼容旧调用方/测试）。内部复用累加器，因此负数/重复事件语义同上。
+ */
 export function parseUsage(obj: any): ParsedUsage | null {
-  const usage = obj?.usage ?? obj?.message?.usage ?? obj?.response?.usage;
-  if (!usage || typeof usage !== "object") return null;
-
-  const promptTokens = num(usage.prompt_tokens ?? usage.input_tokens);
-  const completionTokens = num(usage.completion_tokens ?? usage.output_tokens);
-  const totalTokens = num(usage.total_tokens) || promptTokens + completionTokens;
-  if (!promptTokens && !completionTokens && !totalTokens) return null;
-
-  const promptDetails = usage.prompt_tokens_details ?? {};
-  const cacheReadTokens =
-    num(usage.cache_read_input_tokens ?? usage.cache_read_tokens) ||
-    num(promptDetails.cached_tokens);
-  const cacheWriteTokens =
-    num(usage.cache_creation_input_tokens ?? usage.cache_write_tokens) ||
-    num(promptDetails.cache_creation_tokens);
-  const cacheWrite1hTokens = num(usage.cache_write_1h_tokens);
-
+  const acc = new UsageAccumulator();
+  acc.feed(obj);
+  const result = acc.result();
+  if (!result.seen) return null;
   return {
-    promptTokens,
-    completionTokens,
-    totalTokens,
-    cacheWriteTokens,
-    cacheReadTokens,
-    cacheWrite1hTokens,
+    promptTokens: result.promptTokens,
+    completionTokens: result.completionTokens,
+    totalTokens: result.totalTokens,
+    cacheWriteTokens: result.cacheWriteTokens,
+    cacheReadTokens: result.cacheReadTokens,
+    cacheWrite1hTokens: result.cacheWrite1hTokens,
+    // 保持旧契约字段集合不变（promptIncludesCache 由 withNestBilling 使用）
   };
 }
 
-function contentChars(obj: any): number {
-  const choice = Array.isArray(obj?.choices) ? obj.choices[0] : null;
-  const content = choice?.delta?.content ?? choice?.message?.content ?? choice?.text;
-  if (typeof content === "string") return content.length;
-  if (Array.isArray(content)) {
-    return content.reduce(
-      (sum, part) => sum + (typeof part?.text === "string" ? part.text.length : 0),
-      0
-    );
-  }
-  return 0;
+function tokenizerContext(ctx: NestBillingContext): TokenizerContext {
+  return { model: ctx.model };
 }
 
-function estimatedUsage(ctx: NestBillingContext, chars: number): ParsedUsage {
+/** 无上游 usage 时的估算：prompt 用预检估算值，completion 用已流出内容重新计数 */
+function estimatedUsage(ctx: NestBillingContext, text: string): ParsedUsage {
   const promptTokens = Math.max(1, Math.floor(ctx.promptTokensEstimate || 1));
-  const completionTokens = Math.max(1, Math.ceil(chars / 4));
+  const completionTokens = text ? countTextTokens(text, tokenizerContext(ctx)) : 0;
   return {
     promptTokens,
     completionTokens,
@@ -77,44 +64,144 @@ function estimatedUsage(ctx: NestBillingContext, chars: number): ParsedUsage {
     cacheWriteTokens: 0,
     cacheReadTokens: 0,
     cacheWrite1hTokens: 0,
+    promptIncludesCache: false,
   };
 }
 
-async function settleOnce(
-  ctx: NestBillingContext,
-  state: {
-    settled: boolean;
-    usage: ParsedUsage | null;
-    chars: number;
-    status: number;
-    error: string | null;
-    aborted: boolean;
-    requestId: string | null;
+interface SettleState {
+  settled: boolean;
+  acc: UsageAccumulator;
+  status: number;
+  error: string | null;
+  aborted: boolean;
+  requestId: string | null;
+  /** T2.4：请求级上游成本（USD，从响应头/SSE 注释读取） */
+  upstreamCost: number | null;
+  /** T2.4：实际路由后的模型/供应商（含回退/组合） */
+  upstreamModel: string | null;
+  upstreamProvider: string | null;
+}
+
+/** 头部/注释值可能是 encodeURIComponent 过的（非 ASCII），尽量还原 */
+function decodeHeaderValue(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
   }
-): Promise<void> {
+}
+
+/**
+ * 从 SSE 注释行读取 OmniRoute 元信息（T2.4/N11）。
+ * 格式：`: x-omniroute-response-cost=0.0000123456`（与 buildOmniRouteSseMetadataComment 一致）
+ */
+function readSseMetaComment(line: string, state: SettleState): void {
+  const body = line.slice(1).trim();
+  const eq = body.indexOf("=");
+  if (eq <= 0) return;
+  const name = body.slice(0, eq).trim().toLowerCase();
+  const value = body.slice(eq + 1).trim();
+  if (name === OMNIROUTE_RESPONSE_HEADERS.responseCost.toLowerCase()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) state.upstreamCost = parsed;
+    return;
+  }
+  if (name === OMNIROUTE_RESPONSE_HEADERS.model.toLowerCase()) {
+    state.upstreamModel = decodeHeaderValue(value) ?? state.upstreamModel;
+    return;
+  }
+  if (name === OMNIROUTE_RESPONSE_HEADERS.provider.toLowerCase()) {
+    state.upstreamProvider = decodeHeaderValue(value) ?? state.upstreamProvider;
+  }
+}
+
+async function settleOnce(ctx: NestBillingContext, state: SettleState): Promise<void> {
   if (state.settled) return;
   state.settled = true;
-  const usage = state.usage ?? estimatedUsage(ctx, state.chars);
+
+  const accumulated = state.acc.result();
+  const text = state.acc.contentText();
+  const aborted = state.aborted || ctx.signal?.aborted === true;
+  const usage = accumulated.seen ? accumulated : estimatedUsage(ctx, text);
+  const usageProvenance = accumulated.seen
+    ? "upstream_usage"
+    : aborted
+      ? "estimated_abort"
+      : "estimated";
+
+  // N3：上游错误帧（慢路径下 HTTP 仍是 200）——没流出任何内容时按失败结算（nest 退款）；
+  // 已产出部分内容则按实际用量结算，但保留错误文案。
+  let status = state.status;
+  let error = state.error;
+  const hasContent = accumulated.contentChars > 0 || text.length > 0;
+  if (accumulated.upstreamError) {
+    if (!hasContent) {
+      status = accumulated.upstreamError.status;
+      error = accumulated.upstreamError.message;
+    } else if (!error) {
+      error = accumulated.upstreamError.message;
+    }
+  }
+
+  // T2.4/N11：成本优先用 OmniRoute 自己算好的请求级成本；缺失时用合并后的 usage 现算。
+  // 未定价（priced:false）不得传 0，否则毛利显示 100% 并掩盖 cost_pending。
+  let upstreamCost = state.upstreamCost;
+  if (upstreamCost == null && state.upstreamProvider) {
+    try {
+      const detailed = await calculateCostDetailed(
+        state.upstreamProvider,
+        state.upstreamModel ?? ctx.model,
+        {
+          input: usage.promptTokens,
+          output: usage.completionTokens,
+          cached_tokens: usage.cacheReadTokens,
+          cache_creation_input_tokens: usage.cacheWriteTokens,
+        },
+        { provider: state.upstreamProvider, model: state.upstreamModel ?? ctx.model }
+      );
+      if (detailed.priced && detailed.costUsd > 0) upstreamCost = detailed.costUsd;
+    } catch {
+      // 成本现算失败不阻断结算：nest 会继续标记 cost_pending，由 Phase 5 回填
+    }
+  }
+
   await nestSettle({
     ticket: ctx.ticket,
-    status: state.status,
-    usage,
+    status,
+    usage: {
+      promptTokens: usage.promptTokens,
+      completionTokens: usage.completionTokens,
+      totalTokens: usage.totalTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWrite1hTokens: usage.cacheWrite1hTokens,
+      promptIncludesCache: usage.promptIncludesCache === true,
+    },
     durationMs: Date.now() - ctx.startedAt,
-    aborted: state.aborted || ctx.signal?.aborted === true,
-    error: state.error,
-    upstreamModel: ctx.model,
+    aborted,
+    error,
+    upstreamModel: state.upstreamModel ?? ctx.model,
+    upstreamProvider: state.upstreamProvider ?? null,
+    upstreamCost,
     omnirouteRequestId: state.requestId ?? ctx.requestId ?? null,
     traceId: state.requestId ?? ctx.requestId ?? null,
+    billingRequestId: ctx.billingRequestId ?? null,
+    usageProvenance,
+    endpoint: ctx.endpoint ?? null,
+    model: ctx.model,
   });
 }
 
 /** Wrap a chat response so its usage is settled exactly once. */
 export function withNestBilling(response: Response, ctx: NestBillingContext | null): Response {
   if (!ctx) return response;
-  const state = {
+  const headerCost = Number(response.headers.get(OMNIROUTE_RESPONSE_HEADERS.responseCost) ?? "");
+  const state: SettleState = {
     settled: false,
-    usage: null as ParsedUsage | null,
-    chars: 0,
+    acc: new UsageAccumulator(),
     status: response.status,
     error: response.ok ? null : `upstream HTTP ${response.status}`,
     aborted: false,
@@ -125,6 +212,10 @@ export function withNestBilling(response: Response, ctx: NestBillingContext | nu
       response.headers.get("x-request-id") ??
       response.headers.get("x-correlation-id") ??
       null,
+    // T2.4：非流式响应：成本/实际模型/供应商都在响应头；流式由 SSE 注释行补齐
+    upstreamCost: Number.isFinite(headerCost) && headerCost > 0 ? headerCost : null,
+    upstreamModel: decodeHeaderValue(response.headers.get(OMNIROUTE_RESPONSE_HEADERS.model)),
+    upstreamProvider: decodeHeaderValue(response.headers.get(OMNIROUTE_RESPONSE_HEADERS.provider)),
   };
 
   // Client cancellations should still settle against what was consumed.
@@ -146,6 +237,7 @@ export function withNestBilling(response: Response, ctx: NestBillingContext | nu
   if (contentType.includes("text/event-stream")) {
     const decoder = new TextDecoder();
     let buffer = "";
+    let lastEvent = "";
     const transformer = new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, controller) {
         controller.enqueue(chunk);
@@ -155,14 +247,22 @@ export function withNestBilling(response: Response, ctx: NestBillingContext | nu
           buffer = lines.pop() ?? "";
           for (const rawLine of lines) {
             const line = rawLine.trim();
+            // T2.4/N11：SSE 元信息以注释行下发（`: x-omniroute-response-cost=…`）
+            if (line.startsWith(":")) {
+              readSseMetaComment(line, state);
+              continue;
+            }
+            // `event: error` 后紧跟的 data 帧是错误体（N3）
+            if (line.startsWith("event:")) {
+              lastEvent = line.slice(6).trim();
+              if (lastEvent === "error") state.acc.markError(502, "upstream error frame");
+              continue;
+            }
             if (!line.startsWith("data:")) continue;
             const data = line.slice(5).trim();
             if (!data || data === "[DONE]") continue;
             try {
-              const parsed = JSON.parse(data);
-              const usage = parseUsage(parsed);
-              if (usage) state.usage = usage;
-              state.chars += contentChars(parsed);
+              state.acc.feed(JSON.parse(data));
             } catch {
               // Ignore non-JSON keepalive frames.
             }
@@ -189,14 +289,13 @@ export function withNestBilling(response: Response, ctx: NestBillingContext | nu
     .then((text) => {
       try {
         const parsed = JSON.parse(text);
-        const usage = parseUsage(parsed);
-        if (usage) state.usage = usage;
-        state.chars = contentChars(parsed);
+        state.acc.feed(parsed);
         if (!response.ok) {
           state.error = String(parsed?.error?.message ?? state.error ?? "upstream error");
         }
       } catch {
-        state.chars = text.length;
+        // 非 JSON 响应：按字符量估算（保留原行为）
+        state.acc.feed({ choices: [{ message: { content: text } }] });
       }
     })
     .catch(() => {})
