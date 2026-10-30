@@ -65,6 +65,53 @@ env:
   IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
 
 jobs:
+  # ── 0. Billing contract (T6.8) ─────────────────────────────────────────────
+  # nest 计费钩子被上游合并/重构删掉时，边缘会静默变成“不计费”。
+  # 这里在构建/部署前跑计费单测 + 静态断言，不过就不部署（Gate 2 / F6）。
+  billing-contract:
+    name: billing contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Static hook assertions
+        run: |
+          set -euo pipefail
+          # 每个已接入边缘计费的端点必须保留预检/结算包装。
+          # Phase 3 接入 /v1/messages 后，把该文件也加进列表。
+          files="src/app/api/v1/chat/completions/route.ts"
+          for f in $files; do
+            if ! grep -qE "withNestBilling|runNestPreflight|preflightWithCandidates" "$f"; then
+              echo "::error::$f lost its nest billing hook (billing would be skipped)"
+              exit 1
+            fi
+          done
+          # 凭据白名单与 outbox worker 也是计费链路的一环
+          grep -q "NEST_BILLED_ENDPOINTS" src/lib/nestBilling/credentials.ts || { echo "::error::credentials whitelist missing"; exit 1; }
+          grep -q "startNestBillingOutboxWorker" src/instrumentation-node.ts || { echo "::error::outbox worker not started"; exit 1; }
+
+      - name: Billing unit tests
+        run: |
+          set -euo pipefail
+          node --import tsx/esm --import ./open-sse/utils/setupPolyfill.ts --import ./tests/_setup/isolateDataDir.ts \
+            --test --test-force-exit \
+            tests/unit/nest-billing.test.ts \
+            tests/unit/nest-billing-sync.test.ts \
+            tests/unit/nest-credentials.test.ts \
+            tests/unit/nest-billing-errors.test.ts \
+            tests/unit/nest-billing-usage.test.ts \
+            tests/unit/nest-billing-cost.test.ts \
+            tests/unit/nest-billing-outbox.test.ts
+
   # ── 1. Headless core image (what the gateway actually runs) ────────────────
   build-core:
     name: build headless core image
@@ -205,9 +252,11 @@ jobs:
   # ── 3. Deploy (pull-only on the host; no build, health-gated, auto-rollback) ─
   deploy:
     name: deploy to gateway host
-    needs: [build-core, build-web]
+    needs: [billing-contract, build-core, build-web]
+    # 计费契约失败 = 边缘可能静默不计费 → 不得部署（T6.8/F6）。
     if: >-
       always() &&
+      needs.billing-contract.result == 'success' &&
       vars.DEPLOY_ENABLED == 'true' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
     runs-on: ubuntu-latest

@@ -599,6 +599,16 @@ export async function registerNodejs(): Promise<void> {
     enforceNestBillingRuntimeEnv()
   );
 
+  // T2.1: outbox replay worker — settle payloads queued while nest was unreachable
+  // must be replayed, otherwise the request is silently never billed. Skips itself
+  // when billing is off, when background services are disabled, or when
+  // NEST_BILLING_OUTBOX_WORKER=0.
+  if (!isBackgroundServicesDisabled()) {
+    await import("@/lib/nestBilling/outboxWorker").then(({ startNestBillingOutboxWorker }) =>
+      startNestBillingOutboxWorker()
+    );
+  }
+
   // Clear stale transient connection cooldowns persisted from an unclean crash.
   // A crash mid-burst can leave far-future `rate_limited_until` values in the DB
   // that cause every connection to be skipped by getProviderCredentials(), making
