@@ -46,6 +46,13 @@ export const NEST_BILLED_ENDPOINTS: ReadonlySet<string> = new Set<string>([
   "/v1/chat/completions",
   // T3.2：Claude 协议（Claude Code / Anthropic SDK）
   "/v1/messages",
+  // T4.1 批 1：Responses / Legacy Completions
+  "/v1/responses",
+  "/v1/completions",
+  // T4.1 批 2：Embeddings / Rerank / Moderations
+  "/v1/embeddings",
+  "/v1/rerank",
+  "/v1/moderations",
 ]);
 
 /** 只做校验不预扣的端点（T3.3 的 `count_tokens`）。 */

@@ -8,6 +8,10 @@ import { parseModerationModel } from "@omniroute/open-sse/config/moderationRegis
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { generateRequestId } from "@/shared/utils/requestId";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
 import {
   isKeyScopeBlockedCredentials,
   keyScopeBlockedResponse,
@@ -52,41 +56,68 @@ async function postHandler(request, context) {
 
   const model = body.model || "omni-moderation-latest";
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, model);
-  if (policy.rejection) return policy.rejection;
-  // GHSA-3w2r: credential selection stays inside the key's connection scope,
-  // the same scope chat applies.
-  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
-  if (scope.rejection) return scope.rejection;
+  // T4.1 批 2：Moderations 接入边缘计费（无 usage 时按 prompt 估算结算）
+  let nestCtx: NestBillingContext | null = null;
+  const outcome = await runNestPreflight(request, body, {
+    endpoint: "/v1/moderations",
+    requestedModel: model,
+    maxTokens: 1,
+    stream: false,
+    requestId:
+      resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ?? generateRequestId(),
+    idempotencyKey: request.headers.get("x-idempotency-key"),
+    clientIp: request.headers.get("x-real-ip"),
+    errorFormat: "openai",
+  });
+  if (outcome.status === "rejection") return outcome.rejection;
+  if (outcome.status === "billing") nestCtx = outcome.ctx;
 
-  const { provider } = parseModerationModel(model);
+  try {
+    // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
+    const policy = nestCtx
+      ? { rejection: null, apiKeyInfo: null }
+      : await enforceApiKeyPolicy(request, model);
+    if (policy.rejection) return policy.rejection;
+    // GHSA-3w2r: credential selection stays inside the key's connection scope,
+    // the same scope chat applies.
+    const scope = nestCtx
+      ? { rejection: null, allowedConnections: undefined }
+      : await resolveKeyConnectionScope(policy.apiKeyInfo);
+    if (scope.rejection) return scope.rejection;
 
-  // Default to openai if no provider prefix
-  const resolvedProvider = provider || "openai";
-  const credentials = await getProviderCredentialsWithQuotaPreflight(
-    resolvedProvider,
-    null,
-    scope.allowedConnections
-  );
-  if (!credentials) {
-    return errorResponse(
-      HTTP_STATUS.BAD_REQUEST,
-      `No credentials for provider: ${resolvedProvider}`
+    const { provider } = parseModerationModel(model);
+
+    // Default to openai if no provider prefix
+    const resolvedProvider = provider || "openai";
+    const credentials = await getProviderCredentialsWithQuotaPreflight(
+      resolvedProvider,
+      null,
+      scope.allowedConnections
     );
-  }
-  if (isKeyScopeBlockedCredentials(credentials)) {
-    return keyScopeBlockedResponse(resolvedProvider, credentials);
-  }
-  if (isAllRateLimitedCredentials(credentials)) {
-    return rateLimitedProviderResponse(resolvedProvider, credentials);
-  }
+    if (!credentials) {
+      return errorResponse(
+        HTTP_STATUS.BAD_REQUEST,
+        `No credentials for provider: ${resolvedProvider}`
+      );
+    }
+    if (isKeyScopeBlockedCredentials(credentials)) {
+      return keyScopeBlockedResponse(resolvedProvider, credentials);
+    }
+    if (isAllRateLimitedCredentials(credentials)) {
+      return rateLimitedProviderResponse(resolvedProvider, credentials);
+    }
 
-  const response = await handleModeration({ body: { ...body, model }, credentials });
-  if (response?.ok) {
-    await clearRecoveredProviderState(credentials as Record<string, unknown>);
+    const response = await handleModeration({ body: { ...body, model }, credentials });
+    if (response?.ok) {
+      await clearRecoveredProviderState(credentials as Record<string, unknown>);
+    }
+    return response ? withNestBilling(response, nestCtx) : response;
+  } catch (error) {
+    if (nestCtx) {
+      void nestSettle(nestAbortSettleInput(nestCtx, error));
+    }
+    throw error;
   }
-  return response;
 }
 
 export const POST = withInjectionGuard(postHandler);

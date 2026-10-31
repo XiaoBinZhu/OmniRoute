@@ -9,6 +9,11 @@ import {
 } from "@/shared/utils/compressionHeaderEcho";
 import { withChatAdmission } from "@/shared/middleware/withChatAdmission";
 import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
+import { generateRequestId } from "@/shared/utils/requestId";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { edgeEstimateCompletionCap } from "@/lib/nestBilling/config";
 
 let initPromise = null;
 // `logger: null` — the guardrail registry re-evaluates this request inside
@@ -58,10 +63,16 @@ async function postHandler(request: Request) {
   // on the response when internal early-returns drop the meta the docs promise.
   const compressionRequestHeader = readCompressionRequestHeader(request);
 
-  // Prompt injection guard
+  let nestCtx: NestBillingContext | null = null;
   try {
-    const cloned = request.clone();
-    const body = await cloned.json().catch(() => null);
+    // Parse once for injection guard + nest billing (the request is cloned, never consumed).
+    let body: any = null;
+    try {
+      body = await request.clone().json();
+    } catch {
+      body = null;
+    }
+
     if (body) {
       const { blocked, result } = injectionGuard(body);
       if (blocked) {
@@ -77,60 +88,69 @@ async function postHandler(request: Request) {
           { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
         );
       }
-
-      // Normalize legacy completions format: { prompt, model } → { messages, model }
-      // If the body has `prompt` but no `messages`, convert to chat format.
-      if (body.prompt !== undefined && !body.messages) {
-        const prompt = Array.isArray(body.prompt) ? body.prompt.join("\n") : String(body.prompt);
-        const normalized = {
-          ...body,
-          messages: [{ role: "user", content: prompt }],
-        };
-        delete normalized.prompt;
-
-        const newRequest = new Request(request.url, {
-          method: request.method,
-          headers: request.headers,
-          body: JSON.stringify(normalized),
-          signal: request.signal,
-        });
-        // #3571 — translate the chat-pipeline response back to the legacy
-        // text-completion shape so OpenAI Completion clients (e.g. TabbyML) work.
-        // Thread `body.model` so response `body.model` echoes the caller's
-        // requested identifier, matching the `x-omniroute-model` header, and
-        // echo the compression header on the way out.
-        return withCompressionHeaderEcho(
-          await asTextCompletionResponse(
-            await handleChat(newRequest, () => buildClientRawRequest(request, body)),
-            typeof body.model === "string" ? body.model : undefined
-          ),
-          compressionRequestHeader
-        );
-      }
     }
+
+    // T4.1 批 1：Legacy Completions 接入边缘计费（原始名/端点/上限与 chat 同口径）
+    const requestedModel = typeof body?.model === "string" ? body.model.trim() : "";
+    const declaredMax = Number(body?.max_tokens ?? body?.max_completion_tokens ?? 0);
+    const outcome = await runNestPreflight(request, body, {
+      endpoint: "/v1/completions",
+      requestedModel,
+      maxTokens: Math.min(
+        Number.isFinite(declaredMax) && declaredMax > 0 ? Math.floor(declaredMax) : 4096,
+        edgeEstimateCompletionCap()
+      ),
+      stream: body?.stream === true,
+      requestId:
+        resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+        generateRequestId(),
+      idempotencyKey: request.headers.get("x-idempotency-key"),
+      clientIp: request.headers.get("x-real-ip"),
+      errorFormat: "openai",
+    });
+    if (outcome.status === "rejection") return outcome.rejection;
+    if (outcome.status === "billing") nestCtx = outcome.ctx;
+
+    // Normalize legacy completions format: { prompt, model } → { messages, model }
+    if (body && body.prompt !== undefined && !body.messages) {
+      const prompt = Array.isArray(body.prompt) ? body.prompt.join("\n") : String(body.prompt);
+      const normalized = {
+        ...body,
+        messages: [{ role: "user", content: prompt }],
+      };
+      delete normalized.prompt;
+
+      const newRequest = new Request(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: JSON.stringify(normalized),
+        signal: request.signal,
+      });
+      // #3571 — translate the chat-pipeline response back to the legacy
+      // text-completion shape so OpenAI Completion clients (e.g. TabbyML) work.
+      const raw = await handleChat(newRequest, () => buildClientRawRequest(request, body));
+      return withCompressionHeaderEcho(
+        await asTextCompletionResponse(
+          withNestBilling(raw, nestCtx),
+          typeof body.model === "string" ? body.model : undefined
+        ),
+        compressionRequestHeader
+      );
+    }
+
+    // Standard path: body already has messages[] (chat format). Still emit the legacy
+    // text-completion shape — this is the /v1/completions contract (#3571).
+    const raw = await handleChat(request);
+    return withCompressionHeaderEcho(
+      await asTextCompletionResponse(withNestBilling(raw, nestCtx), requestedModel || undefined),
+      compressionRequestHeader
+    );
   } catch (error) {
-    console.error("[SECURITY] Prompt injection guard failed:", error);
-  }
-
-  // Standard path: body already has messages[] (chat format). Still emit the legacy
-  // text-completion shape — this is the /v1/completions contract (#3571).
-  // Re-read body.model so the response echoes the caller's requested identifier.
-  let requestedModel: string | undefined;
-  try {
-    const bodyForModel = await request
-      .clone()
-      .json()
-      .catch(() => null);
-    if (bodyForModel && typeof bodyForModel.model === "string") {
-      requestedModel = bodyForModel.model;
+    if (nestCtx) {
+      void nestSettle(nestAbortSettleInput(nestCtx, error));
     }
-  } catch {
-    // ignore — asTextCompletionResponse falls back to upstream body.model
+    throw error;
   }
-  return withCompressionHeaderEcho(
-    await asTextCompletionResponse(await handleChat(request), requestedModel),
-    compressionRequestHeader
-  );
 }
 
 export const POST = withChatAdmission(postHandler);

@@ -48,7 +48,18 @@ test("凭据判定：sk- 与 JWT 命中，sk-ant-* 与非凭据串不命中", ()
 });
 
 test("端点白名单：/v1 与 /api/v1 都命中 chat/messages，其它端点不命中", () => {
-  assert.deepEqual([...NEST_BILLED_ENDPOINTS], ["/v1/chat/completions", "/v1/messages"]);
+  assert.deepEqual(
+    [...NEST_BILLED_ENDPOINTS],
+    [
+      "/v1/chat/completions",
+      "/v1/messages",
+      "/v1/responses",
+      "/v1/completions",
+      "/v1/embeddings",
+      "/v1/rerank",
+      "/v1/moderations",
+    ]
+  );
   assert.equal(nestBilledEndpoint("http://localhost/v1/messages"), "/v1/messages");
   assert.equal(nestBilledEndpoint("http://localhost/api/v1/messages"), "/v1/messages");
   assert.equal(nestBilledEndpoint("http://localhost/api/v1/messages/"), "/v1/messages");
@@ -65,7 +76,11 @@ test("端点白名单：/v1 与 /api/v1 都命中 chat/messages，其它端点�
     nestBilledEndpoint("http://localhost/api/v1/chat/completions/"),
     "/v1/chat/completions"
   );
-  assert.equal(nestBilledEndpoint("http://localhost/v1/embeddings"), null);
+  assert.equal(nestBilledEndpoint("http://localhost/v1/embeddings"), "/v1/embeddings");
+  assert.equal(nestBilledEndpoint("http://localhost/v1/responses"), "/v1/responses");
+  assert.equal(nestBilledEndpoint("http://localhost/v1/completions"), "/v1/completions");
+  assert.equal(nestBilledEndpoint("http://localhost/v1/rerank"), "/v1/rerank");
+  assert.equal(nestBilledEndpoint("http://localhost/v1/moderations"), "/v1/moderations");
   assert.equal(nestBilledEndpoint("http://localhost/api/v1/models"), null);
   // 非端点路径（含无法构成绝对地址的串）一律不命中
   assert.equal(nestBilledEndpoint("not a url"), null);
