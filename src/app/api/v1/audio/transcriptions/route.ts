@@ -24,7 +24,6 @@ import { resolveModel } from "@omniroute/open-sse/services/wildcardRouter.ts";
 import { resolveModelAliasFromMap } from "@omniroute/open-sse/services/model.ts";
 import { isModelAllowedForKey } from "@/lib/db/apiKeys";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
-import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
