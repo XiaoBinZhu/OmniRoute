@@ -11,8 +11,9 @@ import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestSettle, type NestBillingContext } from "@/lib/nestBilling";
 import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -80,7 +81,10 @@ async function postHandler(request, context) {
       errorFormat: "openai",
     });
     if (outcome.status === "rejection") return outcome.rejection;
-    if (outcome.status === "billing") nestCtx = outcome.ctx;
+    if (outcome.status === "billing") {
+      nestCtx = outcome.ctx;
+      rememberNestCtx(request, nestCtx);
+    }
   }
 
   // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
@@ -112,7 +116,7 @@ async function postHandler(request, context) {
         allowedConnections,
         isTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
       });
-      return withNestBilling(comboResponse, nestCtx);
+      return comboResponse;
     }
   }
 
@@ -226,8 +230,8 @@ async function postHandler(request, context) {
     }
     return response;
   }
-  // 错误响应由 withNestBilling 按 status>=400 自动退款（不重复 settle）
-  return withNestBilling(response, nestCtx);
+  // 成功/错误响应由出口 withNestFinalize 统一结算/退款
+  return response;
 }
 
-export const POST = withInjectionGuard(postHandler);
+export const POST = withNestFinalize(withInjectionGuard(postHandler));

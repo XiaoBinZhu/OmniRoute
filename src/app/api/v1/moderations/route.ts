@@ -10,8 +10,9 @@ import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestSettle, type NestBillingContext } from "@/lib/nestBilling";
 import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 import {
   isKeyScopeBlockedCredentials,
   keyScopeBlockedResponse,
@@ -70,7 +71,10 @@ async function postHandler(request, context) {
     errorFormat: "openai",
   });
   if (outcome.status === "rejection") return outcome.rejection;
-  if (outcome.status === "billing") nestCtx = outcome.ctx;
+  if (outcome.status === "billing") {
+    nestCtx = outcome.ctx;
+    rememberNestCtx(request, nestCtx);
+  }
 
   try {
     // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
@@ -111,7 +115,7 @@ async function postHandler(request, context) {
     if (response?.ok) {
       await clearRecoveredProviderState(credentials as Record<string, unknown>);
     }
-    return response ? withNestBilling(response, nestCtx) : response;
+    return response;
   } catch (error) {
     if (nestCtx) {
       void nestSettle(nestAbortSettleInput(nestCtx, error));
@@ -120,4 +124,4 @@ async function postHandler(request, context) {
   }
 }
 
-export const POST = withInjectionGuard(postHandler);
+export const POST = withNestFinalize(withInjectionGuard(postHandler));

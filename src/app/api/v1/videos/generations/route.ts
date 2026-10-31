@@ -15,8 +15,9 @@ import * as log from "@/sse/utils/logger";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
+import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -91,7 +92,10 @@ async function postHandler(request, context) {
       errorFormat: "openai",
     });
     if (outcome.status === "rejection") return outcome.rejection;
-    if (outcome.status === "billing") nestCtx = outcome.ctx;
+    if (outcome.status === "billing") {
+      nestCtx = outcome.ctx;
+      rememberNestCtx(request, nestCtx);
+    }
   }
 
   // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
@@ -156,7 +160,7 @@ async function postHandler(request, context) {
           log
         )
       );
-      return withNestBilling(comboResult, nestCtx);
+      return comboResult;
     }
   }
 
@@ -240,25 +244,19 @@ async function postHandler(request, context) {
   );
 
   if (isMediaGenerationFailure(result)) {
-    return withNestBilling(
-      failedMediaGenerationResponse(result, "Video generation provider error"),
-      nestCtx
-    );
+    return failedMediaGenerationResponse(result, "Video generation provider error");
   }
 
   await clearRecoveredProviderState(credentials);
-  return withNestBilling(
-    successfulMediaGenerationResponse({
-      result: { data: result.data },
-      billingMode: "video",
-      provider,
-      model: body.model,
-      startTime,
-      duration: body.duration,
-      apiKeyId: policy.apiKeyInfo?.id,
-    }),
-    nestCtx
-  );
+  return successfulMediaGenerationResponse({
+    result: { data: result.data },
+    billingMode: "video",
+    provider,
+    model: body.model,
+    startTime,
+    duration: body.duration,
+    apiKeyId: policy.apiKeyInfo?.id,
+  });
 }
 
-export const POST = withInjectionGuard(postHandler);
+export const POST = withNestFinalize(withInjectionGuard(postHandler));

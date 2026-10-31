@@ -22,8 +22,9 @@ import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
-import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { type NestBillingContext } from "@/lib/nestBilling";
+import { runNestPreflight } from "@/lib/nestBilling/guard";
+import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -163,7 +164,10 @@ async function postHandler(request, context) {
       errorFormat: "openai",
     });
     if (outcome.status === "rejection") return outcome.rejection;
-    if (outcome.status === "billing") nestCtx = outcome.ctx;
+    if (outcome.status === "billing") {
+      nestCtx = outcome.ctx;
+      rememberNestCtx(request, nestCtx);
+    }
   }
 
   // Authenticate before policy enforcement. Policy checks intentionally allow
@@ -232,7 +236,7 @@ async function postHandler(request, context) {
         startTime,
         log
       );
-      return withNestBilling(comboResult, nestCtx);
+      return comboResult;
     }
   }
 
@@ -478,13 +482,10 @@ async function postHandler(request, context) {
       latencyMs: Date.now() - startTime,
       requestId: generateRequestId(),
     });
-    return withNestBilling(
-      new Response(JSON.stringify((result as { data: unknown }).data), {
-        status: 200,
-        headers,
-      }),
-      nestCtx
-    );
+    return new Response(JSON.stringify((result as { data: unknown }).data), {
+      status: 200,
+      headers,
+    });
   }
 
   const errorPayload = toJsonErrorPayload(
@@ -498,13 +499,10 @@ async function postHandler(request, context) {
       ? errorPayload.error.message
       : "Image generation provider error";
   const failed = errorResponse((result as any).status, message);
-  if (nestCtx) {
-    void nestSettle(nestAbortSettleInput(nestCtx, new Error(message)));
-  }
   return failed;
 }
 
-const guardedPost = withInjectionGuard(postHandler);
+const guardedPost = withNestFinalize(withInjectionGuard(postHandler));
 
 export function POST(request: Request, context?: unknown) {
   // #16260 — the Playground SSE keepalive wrapper is honoured only with
