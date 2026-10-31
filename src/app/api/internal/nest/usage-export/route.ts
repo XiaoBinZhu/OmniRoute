@@ -42,11 +42,13 @@ export async function GET(request: Request): Promise<Response> {
 
   try {
     const rows = listCallLogsForNestExport(since, cursor, limit);
+    // 复合游标 `<timestamp>|<id>`：id 是 UUID，单列排序与时间无关，跨页会漏行
+    const last = rows.length > 0 ? rows[rows.length - 1] : null;
     return new Response(
       JSON.stringify({
         ok: true,
         rows,
-        nextCursor: rows.length > 0 ? rows[rows.length - 1].id : null,
+        nextCursor: last ? `${last.timestamp}|${last.id}` : null,
         since,
       }),
       { status: 200, headers: { "content-type": "application/json", "cache-control": "no-store" } }

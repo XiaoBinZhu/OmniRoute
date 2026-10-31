@@ -38,6 +38,8 @@ export interface ImageRequestAccounting {
   apiKeyInfo?: { id?: string | null; name?: string | null } | null;
   /** Credentials selected for this attempt; only `connectionId` is read. */
   credentials?: unknown;
+  /** T5.1：与 nest 日志一致的 correlationId（成本回填用） */
+  correlationId?: string | null;
   startTime: number;
   comboStrategy?: string | null;
 }
@@ -71,7 +73,10 @@ export async function runImageRequestWithAccounting<T>(
   const apiKeyId = accounting.apiKeyInfo?.id || null;
   const apiKeyName = accounting.apiKeyInfo?.name || null;
 
-  const result = await runWithCallLogApiKeyContext({ apiKeyId, apiKeyName, connectionId }, attempt);
+  const result = await runWithCallLogApiKeyContext(
+    { apiKeyId, apiKeyName, connectionId, correlationId: accounting.correlationId ?? null },
+    attempt
+  );
 
   const usage = upstreamUsageOf(result);
   if ((result as { success?: unknown } | null)?.success === true && usage) {

@@ -17,7 +17,7 @@ import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
-import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
+import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -128,6 +128,8 @@ async function postHandler(request, context) {
       {
         apiKeyId: policy.apiKeyInfo?.id ?? null,
         apiKeyName: policy.apiKeyInfo?.name ?? null,
+        // T5.1：call_logs 需与 nest 日志共用 correlationId，成本回填才能命中
+        correlationId: getNestRequestId(request),
       },
       callback
     );

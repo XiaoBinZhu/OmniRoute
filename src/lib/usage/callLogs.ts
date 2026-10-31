@@ -1017,18 +1017,19 @@ export function setCallLogNestCostByCorrelation(correlationId: string, costUsd: 
   return hit;
 }
 
-/** 落库后补写暂存成本（由 saveCallLogOperation 调用） */
+/** 落库后补写暂存成本（由 saveCallLogOperation 调用；仅写入成功才移除暂存） */
 function flushPendingNestCost(id: unknown, correlationId: unknown): void {
   const key = typeof correlationId === "string" ? correlationId : "";
   const rowId = typeof id === "string" ? id : "";
   if (!key || !rowId) return;
   const cost = pendingNestCost.get(key);
   if (cost == null) return;
-  pendingNestCost.delete(key);
   try {
     setCallLogNestCostById(rowId, cost);
+    // 只在真正写入成功后移除暂存；失败时保留，下一轮导出仍带相同 correlation 的 cost
+    pendingNestCost.delete(key);
   } catch {
-    // 补写失败不回填暂存（下一轮导出仍会带有相同 correlation 的 cost）
+    // 补写失败：保留暂存供下次落库重试
   }
 }
 
@@ -1043,7 +1044,10 @@ export function setCallLogNestCostById(id: string, costUsd: number): void {
 }
 
 /**
- * T5.1：nest 成本回填的只读导出行（游标分页，按 id 升序；不包含任何正文）。
+ * T5.1：nest 成本回填的只读导出行（复合游标分页，按 (timestamp,id) 升序；不包含任何正文）。
+ *
+ * 注意：`call_logs.id` 是 UUID，单独按 id 排序与时间顺序无关，跨页会漏行，
+ * 因此游标编码为 `<timestamp>|<id>` 并与 `ORDER BY timestamp, id` 配套。
  * 只返回已落库的行；cost 为 null 表示当时未拿到上游成本。
  */
 export function listCallLogsForNestExport(
@@ -1065,18 +1069,31 @@ export function listCallLogsForNestExport(
   costUsd: number | null;
 }> {
   const db = getDbInstance();
+  let cursorTs: string | null = null;
+  let cursorId: string | null = null;
+  if (cursor && cursor.includes("|")) {
+    const [ts, id] = cursor.split("|", 2);
+    if (ts && id) {
+      cursorTs = ts;
+      cursorId = id;
+    }
+  }
   const rows = db
     .prepare(
       `SELECT id, correlation_id, timestamp, path, status, model, provider,
               tokens_in, tokens_out, tokens_cache_read, tokens_cache_creation, nest_cost_usd
          FROM call_logs
-        WHERE timestamp >= @since AND (@cursor IS NULL OR id > @cursor)
-        ORDER BY id ASC
+        WHERE timestamp >= @since
+          AND (@cursorTs IS NULL
+               OR timestamp > @cursorTs
+               OR (timestamp = @cursorTs AND id > @cursorId))
+        ORDER BY timestamp ASC, id ASC
         LIMIT @limit`
     )
     .all({
       since: sinceIso,
-      cursor: cursor ?? null,
+      cursorTs,
+      cursorId,
       limit: Math.max(1, Math.min(1000, Math.floor(limit) || 500)),
     }) as Array<Record<string, unknown>>;
   return rows.map((row) => ({
