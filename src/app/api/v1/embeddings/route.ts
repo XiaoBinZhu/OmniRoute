@@ -19,7 +19,8 @@ import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
-import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
+import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
+import { runWithCallLogApiKeyContext } from "@/lib/usage/callLogApiKeyContext";
 
 export const dynamic = "force-dynamic";
 
@@ -123,14 +124,24 @@ async function postHandler(request, context) {
       headers: Object.fromEntries(request.headers.entries()),
     };
 
-    const response = await handleValidatedEmbeddingRequestBody(body as ValidatedEmbeddingBody, {
-      clientRawRequest,
-      apiKeyId: apiKeyMeta?.id || null,
-      apiKeyName: apiKeyMeta?.name || null,
-      connectionId: null,
-      allowedConnections: scope.allowedConnections,
-      isComboTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
-    });
+    // T5.1：call_logs 需与 nest 日志共用 correlationId，成本回填才能命中
+    const response = await runWithCallLogApiKeyContext(
+      {
+        apiKeyId: apiKeyMeta?.id || null,
+        apiKeyName: apiKeyMeta?.name || null,
+        connectionId: null,
+        correlationId: getNestRequestId(request),
+      },
+      () =>
+        handleValidatedEmbeddingRequestBody(body as ValidatedEmbeddingBody, {
+          clientRawRequest,
+          apiKeyId: apiKeyMeta?.id || null,
+          apiKeyName: apiKeyMeta?.name || null,
+          connectionId: null,
+          allowedConnections: scope.allowedConnections,
+          isComboTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
+        })
+    );
     return response;
   } catch (error) {
     // 异常统一由 withNestFinalize 退款（不在此处 settle，避免重复请求）
