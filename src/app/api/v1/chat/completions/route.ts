@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { createHash } from "node:crypto";
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
 import { handleChat } from "@/sse/handlers/chat";
 import { logAdmissionRejection } from "@/sse/handlers/admissionRejectionLog";
@@ -45,17 +44,8 @@ import {
   isCommonChatGptWebRetirementError,
 } from "@/shared/constants/chatgptWebRetirement";
 import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
-import { resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
-import {
-  isNestBillingEnabled,
-  nestBillingErrorResponse,
-  nestCredentialCandidates,
-  nestSettle,
-  withNestBilling,
-  type NestBillingContext,
-} from "@/lib/nestBilling";
-import { nestPreflightShapeRejection, preflightWithCandidates } from "@/lib/nestBilling/preflight";
-import { estimatePromptTokens } from "@/lib/nestBilling/estimate";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
 import { nestBilledEndpoint } from "@/lib/nestBilling/credentials";
 import {
   getBifrostRoutingConfig,
@@ -332,64 +322,30 @@ export async function POST(request) {
 
     // D2/D3: nest preflight for nest credentials (`sk-` tokens or C-end JWT, 43
     // direct path). OmniRoute keys win when they validate, so local keys keep
-    // their existing behaviour.
+    // their existing behaviour. T3.1: the whole "preflight → context" step is shared
+    // with /v1/messages through runNestPreflight (incl. N4 fail-closed shape gate).
     const parsedBodyIsRecord = isRecord(parsedBody);
-    // T1.1/N4: any nest credential that did NOT pass a preflight must be rejected
-    // before handleChat — a missing model or a non-object body must never reach
-    // the upstream unbilled (fail-closed).
     const billingModel =
       requestedModel ||
       (parsedBodyIsRecord && typeof parsedBody.model === "string" ? parsedBody.model.trim() : "");
-    if (isNestBillingEnabled()) {
-      const nestCandidates = nestCredentialCandidates(request);
-      if (nestCandidates.length > 0) {
-        const localKey = await resolveClientApiKey(request).catch(() => ({ valid: false }));
-        if (!localKey.valid) {
-          // N4：body 不是对象 / 没有 model 时直接 400，绝不进 handleChat。
-          const shapeRejection = nestPreflightShapeRejection({
-            parsedBodyIsRecord,
-            model: billingModel,
-          });
-          if (shapeRejection) {
-            return finishAdmission(errorResponse(shapeRejection.status, shapeRejection.message));
-          }
-          const bodyText = JSON.stringify(parsedBody);
-          // T2.3/N12：图片/base64 不再计入文本估算（否则图生图/视觉请求预扣天价）
-          const promptTokensEstimate = estimatePromptTokens(parsedBody);
-          const bodyDigest = createHash("sha256").update(bodyText).digest("hex");
-          // 逐个尝试候选：只有 401（令牌无效）才换下一个（陈旧 Bearer + 有效
-          // x-api-key 的 Claude Code 场景）；402/403/404/429/5xx 直接透传。
-          const preflight = await preflightWithCandidates(nestCandidates, {
-            model: billingModel,
-            stream: parsedBody.stream === true,
-            // F15：未声明 max_tokens 时按 4096 估算，避免预扣被低估
-            maxTokens:
-              Number(parsedBody.max_tokens ?? parsedBody.max_completion_tokens ?? 4096) || 4096,
-            promptTokens: promptTokensEstimate,
-            bodyDigest,
-            idempotencyKey: request.headers.get("x-idempotency-key"),
-            // T2.2：宿主 nginx 已用 real_ip 写真实客户端 IP，这里原样透传给 nest
-            clientIp: request.headers.get("x-real-ip"),
-          });
-          if (!preflight.ok) {
-            return finishAdmission(nestBillingErrorResponse(preflight));
-          }
-          nestCtx = {
-            ticket: preflight.ticket,
-            startedAt: Date.now(),
-            model: billingModel,
-            promptTokensEstimate,
-            signal: request.signal,
-            // 计费同步（D4）：在 preflight 成功时即固定 reqId，后续 stream/JSON/catch/abort
-            // 全部复用它，确保 settle 的 omnirouteRequestId === call_logs.correlation_id。
-            requestId: callerCorrelationId ?? generateRequestId(),
-            // T2.1：幂等键回传，供 ticket 过期后的迟到结算定位预扣会话
-            billingRequestId: preflight.billingRequestId ?? null,
-            // T3.4：端点随 ticket 写入日志
-            endpoint: nestBilledEndpoint(request.url) ?? "/v1/chat/completions",
-          };
-        }
-      }
+    const nestOutcome = await runNestPreflight(request, parsedBody, {
+      endpoint: nestBilledEndpoint(request.url) ?? "/v1/chat/completions",
+      requestedModel: billingModel,
+      // F15：未声明 max_tokens 时按 4096 估算，避免预扣被低估
+      maxTokens:
+        Number(parsedBody?.max_tokens ?? parsedBody?.max_completion_tokens ?? 4096) || 4096,
+      stream: parsedBody?.stream === true,
+      requestId: callerCorrelationId ?? generateRequestId(),
+      idempotencyKey: request.headers.get("x-idempotency-key"),
+      // T2.2：宿主 nginx 已用 real_ip 写真实客户端 IP，这里原样透传给 nest
+      clientIp: request.headers.get("x-real-ip"),
+      errorFormat: "openai",
+    });
+    if (nestOutcome.status === "rejection") {
+      return finishAdmission(nestOutcome.rejection);
+    }
+    if (nestOutcome.status === "billing") {
+      nestCtx = nestOutcome.ctx;
     }
 
     // Gate the early SSE keepalive wrapper: only wrap when the client explicitly
@@ -513,16 +469,7 @@ export async function POST(request) {
     );
   } catch (error) {
     if (nestCtx) {
-      void nestSettle({
-        ticket: nestCtx.ticket,
-        status: 500,
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-        durationMs: Date.now() - nestCtx.startedAt,
-        error: (error as Error)?.message ?? String(error),
-        upstreamModel: nestCtx.model,
-        omnirouteRequestId: nestCtx.requestId ?? null,
-        traceId: nestCtx.requestId ?? null,
-      });
+      void nestSettle(nestAbortSettleInput(nestCtx, error));
     }
     admission.lease?.release();
     throw error;

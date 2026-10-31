@@ -51,7 +51,12 @@ export function stripBinaryPayloads(input: unknown): StripResult {
       record.type === "input_image" ||
       typeof record.image_url === "string" ||
       (typeof record.image_url === "object" && record.image_url !== null);
-    if (isImageBlock && !insideImage) images += 1;
+    // 图片块整块换空：只计固定 1500，不把 type/source/media_type 等骨架算成文本
+    // （否则“≤ 文本估算 + 1500”会被骨架多出的几十 token 破坏）。
+    if (isImageBlock && !insideImage) {
+      images += 1;
+      return "";
+    }
     const out: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(record)) {
       out[key] = walk(item, insideImage || isImageBlock);

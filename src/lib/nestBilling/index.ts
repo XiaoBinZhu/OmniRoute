@@ -3,6 +3,7 @@ export {
   isNestBillingKeyCandidate,
   isNestBillingChatPath,
   nestBillingConfig,
+  edgeEstimateCompletionCap,
 } from "./config";
 export {
   NEST_BILLED_ENDPOINTS,
@@ -15,8 +16,10 @@ export {
 export {
   nestPreflight,
   nestSettle,
+  nestVerify,
   replayNestBillingOutbox,
   type NestPreflightResult,
+  type NestVerifyResult,
 } from "./client";
 export {
   withNestBilling,
