@@ -7,6 +7,9 @@ import { resolveResponsesApiModel } from "@/app/api/internal/codex-responses-ws/
 import { getModelInfo, getComboForModel } from "@/sse/services/model";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { edgeEstimateCompletionCap } from "@/lib/nestBilling/config";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import {
   admitChatRequest,
@@ -141,6 +144,8 @@ async function postHandler(request: any) {
 
   const admission = admissionResult;
   request = admission.request;
+
+  let nestCtx: NestBillingContext | null = null;
   const finishAdmission = (response: Response) =>
     releaseChatAdmissionWhenDone(response, admission.lease, { signal: request.signal });
 
@@ -214,6 +219,31 @@ async function postHandler(request: any) {
       }
     }
 
+    // T4.1 批 1：Responses 接入边缘计费（与 chat 同一套 runNestPreflight/withNestBilling）
+    {
+      const requestedModel = typeof parsedBody?.model === "string" ? parsedBody.model.trim() : "";
+      const declared = Number(parsedBody?.max_output_tokens ?? parsedBody?.max_tokens ?? 0);
+      const accept = String(request.headers?.get?.("accept") || "");
+      const stream = resolveStreamFlag(parsedBody?.stream, accept, "openai-responses");
+      const outcome = await runNestPreflight(request, parsedBody, {
+        endpoint: "/v1/responses",
+        requestedModel,
+        maxTokens: Math.min(
+          Number.isFinite(declared) && declared > 0 ? Math.floor(declared) : 4096,
+          edgeEstimateCompletionCap()
+        ),
+        stream,
+        requestId:
+          resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+          generateRequestId(),
+        idempotencyKey: request.headers.get("x-idempotency-key"),
+        clientIp: request.headers.get("x-real-ip"),
+        errorFormat: "openai",
+      });
+      if (outcome.status === "rejection") return finishAdmission(outcome.rejection);
+      if (outcome.status === "billing") nestCtx = outcome.ctx;
+    }
+
     // Codex CLI (wire_api="responses") consumes this endpoint over SSE and its reqwest
     // client drops the connection if no bytes arrive within ~5s. Keep the connection
     // warm with transport comments plus sparse parser-visible events while the upstream
@@ -239,23 +269,31 @@ async function postHandler(request: any) {
         { signal: streamSignal }
       );
       const keepaliveFrame = buildRequestKeepaliveFrame(resolvedBody);
-      return await withEarlyStreamKeepalive(handlerResponse, {
-        signal: streamSignal,
-        thresholdMs,
-        startupFrame: keepaliveFrame,
-        applicationKeepalive: {
-          frame: keepaliveFrame,
-          intervalMs: SSE_HEARTBEAT_INTERVAL_MS,
-        },
-        errorFrame: OPENAI_RESPONSES_ERROR_FRAME,
-        extraHeaders: { "X-Correlation-Id": correlationId },
-        correlationId,
-        deadlineController,
-      });
+      return await withNestBilling(
+        await withEarlyStreamKeepalive(handlerResponse, {
+          signal: streamSignal,
+          thresholdMs,
+          startupFrame: keepaliveFrame,
+          applicationKeepalive: {
+            frame: keepaliveFrame,
+            intervalMs: SSE_HEARTBEAT_INTERVAL_MS,
+          },
+          errorFrame: OPENAI_RESPONSES_ERROR_FRAME,
+          extraHeaders: { "X-Correlation-Id": correlationId },
+          correlationId,
+          deadlineController,
+        }),
+        nestCtx
+      );
     }
 
-    return finishAdmission(await handleChat(resolved, null, resolvedBody, correlationId));
+    return finishAdmission(
+      withNestBilling(await handleChat(resolved, null, resolvedBody, correlationId), nestCtx)
+    );
   } catch (error) {
+    if (nestCtx) {
+      void nestSettle(nestAbortSettleInput(nestCtx, error));
+    }
     admission.lease?.release();
     throw error;
   }

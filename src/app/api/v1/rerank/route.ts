@@ -10,6 +10,9 @@ import { parseRerankModel } from "@omniroute/open-sse/config/rerankRegistry.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -73,32 +76,60 @@ async function postHandler(request, _context) {
   }
   const body = validation.data;
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, body.model);
-  if (policy.rejection) return policy.rejection;
-  // GHSA-3w2r: credential selection (direct and per combo target) stays inside
-  // the key's connection scope, the same scope chat applies.
-  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
-  if (scope.rejection) return scope.rejection;
-  // Respect the authenticated API key's credential scope before checking model capabilities.
-  const endpointMismatch = await getRequestedModelEndpointMismatch(body.model, "rerank");
-  if (endpointMismatch) return errorResponse(HTTP_STATUS.BAD_REQUEST, endpointMismatch);
+  // T4.1 批 2：Rerank 接入边缘计费
+  let nestCtx: NestBillingContext | null = null;
+  const outcome = await runNestPreflight(request, body, {
+    endpoint: "/v1/rerank",
+    requestedModel: body.model,
+    maxTokens: 1,
+    stream: false,
+    requestId:
+      resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ?? generateRequestId(),
+    idempotencyKey: request.headers.get("x-idempotency-key"),
+    clientIp: request.headers.get("x-real-ip"),
+    errorFormat: "openai",
+  });
+  if (outcome.status === "rejection") return outcome.rejection;
+  if (outcome.status === "billing") nestCtx = outcome.ctx;
 
-  return handleValidatedRerankRequestBody(
-    {
-      ...body,
-      documents: body.documents,
-      top_n: typeof body.top_n === "number" ? body.top_n : undefined,
-      return_documents:
-        typeof body.return_documents === "boolean" ? body.return_documents : undefined,
-    },
-    {
-      apiKeyId: policy.apiKeyInfo?.id || null,
-      apiKeyName: policy.apiKeyInfo?.name || null,
-      allowedConnections: scope.allowedConnections,
-      isComboTargetAllowed: createComboTargetKeyGate(policy, body.model),
+  try {
+    // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
+    const policy = nestCtx
+      ? { rejection: null, apiKeyInfo: null }
+      : await enforceApiKeyPolicy(request, body.model);
+    if (policy.rejection) return policy.rejection;
+    // GHSA-3w2r: credential selection (direct and per combo target) stays inside
+    // the key's connection scope, the same scope chat applies.
+    const scope = nestCtx
+      ? { rejection: null, allowedConnections: undefined }
+      : await resolveKeyConnectionScope(policy.apiKeyInfo);
+    if (scope.rejection) return scope.rejection;
+    // Respect the authenticated API key's credential scope before checking model capabilities.
+    const endpointMismatch = await getRequestedModelEndpointMismatch(body.model, "rerank");
+    if (endpointMismatch) return errorResponse(HTTP_STATUS.BAD_REQUEST, endpointMismatch);
+
+    const response = await handleValidatedRerankRequestBody(
+      {
+        ...body,
+        documents: body.documents,
+        top_n: typeof body.top_n === "number" ? body.top_n : undefined,
+        return_documents:
+          typeof body.return_documents === "boolean" ? body.return_documents : undefined,
+      },
+      {
+        apiKeyId: policy.apiKeyInfo?.id || null,
+        apiKeyName: policy.apiKeyInfo?.name || null,
+        allowedConnections: scope.allowedConnections,
+        isComboTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
+      }
+    );
+    return withNestBilling(response, nestCtx);
+  } catch (error) {
+    if (nestCtx) {
+      void nestSettle(nestAbortSettleInput(nestCtx, error));
     }
-  );
+    throw error;
+  }
 }
 
 type ValidatedRerankBody = {
