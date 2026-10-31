@@ -26,6 +26,7 @@ import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { runImageRequestWithAccounting } from "@/lib/usage/imageRequestAccounting";
+import { getNestRequestId } from "@/lib/nestBilling/finalize";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
@@ -302,6 +303,8 @@ export async function executeImageCombo(
           model,
           apiKeyInfo: auth.policy?.apiKeyInfo,
           credentials,
+          // T5.1：call_logs 需与 nest 日志共用 correlationId，成本回填才能命中
+          correlationId: getNestRequestId(auth.request),
           startTime,
           comboStrategy: "priority",
         },

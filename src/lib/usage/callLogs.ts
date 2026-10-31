@@ -1011,7 +1011,11 @@ export function setCallLogNestCostByCorrelation(correlationId: string, costUsd: 
     .run({ cost: costUsd, correlationId });
   const hit = Number(res.changes) > 0;
   if (!hit) {
-    if (pendingNestCost.size > 2000) pendingNestCost.clear();
+    // 有界淘汰（不整表清空，避免丢成本）：超限时删最旧的暂存
+    if (pendingNestCost.size >= 2000) {
+      const oldest = pendingNestCost.keys().next().value;
+      if (oldest !== undefined) pendingNestCost.delete(oldest);
+    }
     pendingNestCost.set(correlationId, costUsd);
   }
   return hit;
@@ -1024,23 +1028,21 @@ function flushPendingNestCost(id: unknown, correlationId: unknown): void {
   if (!key || !rowId) return;
   const cost = pendingNestCost.get(key);
   if (cost == null) return;
-  try {
-    setCallLogNestCostById(rowId, cost);
-    // 只在真正写入成功后移除暂存；失败时保留，下一轮导出仍带相同 correlation 的 cost
+  if (setCallLogNestCostById(rowId, cost)) {
+    // 只在真正命中后移除暂存；未命中/失败保留，下一轮导出仍带相同 correlation 的 cost
     pendingNestCost.delete(key);
-  } catch {
-    // 补写失败：保留暂存供下次落库重试
   }
 }
 
-/** 按 call_logs.id 补写成本（saveCallLog 已完成后的兜底路径） */
-export function setCallLogNestCostById(id: string, costUsd: number): void {
-  if (!id || !Number.isFinite(costUsd) || costUsd < 0) return;
+/** 按 call_logs.id 补写成本；返回是否真正命中一行 */
+export function setCallLogNestCostById(id: string, costUsd: number): boolean {
+  if (!id || !Number.isFinite(costUsd) || costUsd < 0) return false;
   const db = getDbInstance();
-  db.prepare(`UPDATE call_logs SET nest_cost_usd = @cost WHERE id = @id`).run({
+  const res = db.prepare(`UPDATE call_logs SET nest_cost_usd = @cost WHERE id = @id`).run({
     cost: costUsd,
     id,
   });
+  return Number(res.changes) > 0;
 }
 
 /**
