@@ -994,6 +994,82 @@ export async function getCallLogs(filter: any = {}) {
   return rows.map(mapSummaryRow);
 }
 
+/**
+ * T5.1：边缘结算后持久化上游成本（USD）。返回是否命中行（call_logs 可能晚于 settle 落库）。
+ * 未命中时由调用方把成本暂存，待 saveCallLog 完成后再补写（见 nestBilling/response.ts）。
+ */
+export function setCallLogNestCostByCorrelation(correlationId: string, costUsd: number): boolean {
+  if (!correlationId || !Number.isFinite(costUsd) || costUsd < 0) return false;
+  const db = getDbInstance();
+  const res = db
+    .prepare(`UPDATE call_logs SET nest_cost_usd = @cost WHERE correlation_id = @correlationId`)
+    .run({ cost: costUsd, correlationId });
+  return Number(res.changes) > 0;
+}
+
+/** 按 call_logs.id 补写成本（saveCallLog 已完成后的兜底路径） */
+export function setCallLogNestCostById(id: string, costUsd: number): void {
+  if (!id || !Number.isFinite(costUsd) || costUsd < 0) return;
+  const db = getDbInstance();
+  db.prepare(`UPDATE call_logs SET nest_cost_usd = @cost WHERE id = @id`).run({
+    cost: costUsd,
+    id,
+  });
+}
+
+/**
+ * T5.1：nest 成本回填的只读导出行（游标分页，按 id 升序；不包含任何正文）。
+ * 只返回已落库的行；cost 为 null 表示当时未拿到上游成本。
+ */
+export function listCallLogsForNestExport(
+  sinceIso: string,
+  cursor: string | null,
+  limit: number
+): Array<{
+  id: string;
+  correlationId: string | null;
+  timestamp: string;
+  path: string;
+  status: number;
+  model: string;
+  provider: string | null;
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+  costUsd: number | null;
+}> {
+  const db = getDbInstance();
+  const rows = db
+    .prepare(
+      `SELECT id, correlation_id, timestamp, path, status, model, provider,
+              tokens_in, tokens_out, tokens_cache_read, tokens_cache_creation, nest_cost_usd
+         FROM call_logs
+        WHERE timestamp >= @since AND (@cursor IS NULL OR id > @cursor)
+        ORDER BY id ASC
+        LIMIT @limit`
+    )
+    .all({
+      since: sinceIso,
+      cursor: cursor ?? null,
+      limit: Math.max(1, Math.min(1000, Math.floor(limit) || 500)),
+    }) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    id: String(row.id),
+    correlationId: row.correlation_id ? String(row.correlation_id) : null,
+    timestamp: String(row.timestamp),
+    path: String(row.path ?? ""),
+    status: Number(row.status ?? 0),
+    model: String(row.model ?? ""),
+    provider: row.provider ? String(row.provider) : null,
+    tokensIn: Number(row.tokens_in ?? 0),
+    tokensOut: Number(row.tokens_out ?? 0),
+    cacheRead: row.tokens_cache_read == null ? null : Number(row.tokens_cache_read),
+    cacheWrite: row.tokens_cache_creation == null ? null : Number(row.tokens_cache_creation),
+    costUsd: row.nest_cost_usd == null ? null : Number(row.nest_cost_usd),
+  }));
+}
+
 export async function getCallLogById(id: string) {
   const db = getDbInstance();
   const row = db
