@@ -8,6 +8,8 @@ export interface CallLogApiKeyContext {
    * that already pass `connectionId` on the entry keep precedence.
    */
   connectionId?: string | null;
+  /** T5.1：与 nest 日志一致的 correlationId（成本回填用）；entry.correlationId 优先 */
+  correlationId?: string | null;
 }
 
 const callLogApiKeyContext = new AsyncLocalStorage<CallLogApiKeyContext>();

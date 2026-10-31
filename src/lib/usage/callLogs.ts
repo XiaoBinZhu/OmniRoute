@@ -664,7 +664,7 @@ async function buildCallLogRow(entry: any): Promise<PreparedCallLogRow> {
     comboName: entry.comboName || null,
     comboStepId: toStringOrNull(entry.comboStepId),
     comboExecutionKey: toStringOrNull(entry.comboExecutionKey) || toStringOrNull(entry.comboStepId),
-    correlationId: entry.correlationId || null,
+    correlationId: entry.correlationId || getCallLogApiKeyContext()?.correlationId || null,
     // Ms of pacing/park wait imposed before dispatch (null = none).
     addedWaitMs:
       typeof entry.addedWaitMs === "number" && Number.isFinite(entry.addedWaitMs)
