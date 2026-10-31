@@ -35,17 +35,25 @@ export function withNestFinalize<TReq extends Request, TCtx>(
   handler: (request: TReq, context?: TCtx) => Promise<Response>
 ): (request: TReq, context?: TCtx) => Promise<Response> {
   return async (request: TReq, context?: TCtx): Promise<Response> => {
-    const response = await handler(request, context);
-    const ctx = (request as unknown as Record<string, unknown>)[CTX_KEY] as
-      NestBillingContext | undefined;
-    if (!ctx || !response) return response;
-    if ((response as unknown as Record<string, unknown>)[FINALIZED_KEY]) return response;
-    if (response.status >= 400) {
-      void nestSettle(
-        nestAbortSettleInput(ctx, new Error(`pre_upstream_reject_${response.status}`))
-      );
-      return markNestFinalized(response);
+    try {
+      const response = await handler(request, context);
+      const ctx = (request as unknown as Record<string, unknown>)[CTX_KEY] as
+        NestBillingContext | undefined;
+      if (!ctx || !response) return response;
+      if ((response as unknown as Record<string, unknown>)[FINALIZED_KEY]) return response;
+      if (response.status >= 400) {
+        void nestSettle(
+          nestAbortSettleInput(ctx, new Error(`pre_upstream_reject_${response.status}`))
+        );
+        return markNestFinalized(response);
+      }
+      return markNestFinalized(withNestBilling(response, ctx));
+    } catch (error) {
+      // 异常也必须退款：否则 hold/并发 lease 会占用到恢复任务回收
+      const ctx = (request as unknown as Record<string, unknown>)[CTX_KEY] as
+        NestBillingContext | undefined;
+      if (ctx) void nestSettle(nestAbortSettleInput(ctx, error));
+      throw error;
     }
-    return markNestFinalized(withNestBilling(response, ctx));
   };
 }
