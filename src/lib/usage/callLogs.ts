@@ -1046,10 +1046,11 @@ export function setCallLogNestCostById(id: string, costUsd: number): boolean {
 }
 
 /**
- * T5.1：nest 成本回填的只读导出行（复合游标分页，按 (timestamp,id) 升序；不包含任何正文）。
+ * T5.1：nest 成本回填的只读导出行（rowid 单调游标，不包含任何正文）。
  *
- * 注意：`call_logs.id` 是 UUID，单独按 id 排序与时间顺序无关，跨页会漏行，
- * 因此游标编码为 `<timestamp>|<id>` 并与 `ORDER BY timestamp, id` 配套。
+ * `timestamp` 可由调用方指定（慢请求可能晚于快请求落库），不能作游标；
+ * `call_logs.id` 是 UUID，排序与写入顺序无关；改用 SQLite 隐式 `rowid`
+ * （与 logExport 模块同一先例，插入单调）。
  * 只返回已落库的行；cost 为 null 表示当时未拿到上游成本。
  */
 export function listCallLogsForNestExport(
@@ -1057,6 +1058,7 @@ export function listCallLogsForNestExport(
   cursor: string | null,
   limit: number
 ): Array<{
+  rowId: number;
   id: string;
   correlationId: string | null;
   timestamp: string;
@@ -1071,34 +1073,24 @@ export function listCallLogsForNestExport(
   costUsd: number | null;
 }> {
   const db = getDbInstance();
-  let cursorTs: string | null = null;
-  let cursorId: string | null = null;
-  if (cursor && cursor.includes("|")) {
-    const [ts, id] = cursor.split("|", 2);
-    if (ts && id) {
-      cursorTs = ts;
-      cursorId = id;
-    }
-  }
+  // 兼容旧复合游标：无法解析时从头开始（UPDATE 幂等）
+  const parsed = cursor && /^\d+$/.test(cursor) ? Number(cursor) : null;
   const rows = db
     .prepare(
-      `SELECT id, correlation_id, timestamp, path, status, model, provider,
+      `SELECT rowid AS row_id, id, correlation_id, timestamp, path, status, model, provider,
               tokens_in, tokens_out, tokens_cache_read, tokens_cache_creation, nest_cost_usd
          FROM call_logs
-        WHERE timestamp >= @since
-          AND (@cursorTs IS NULL
-               OR timestamp > @cursorTs
-               OR (timestamp = @cursorTs AND id > @cursorId))
-        ORDER BY timestamp ASC, id ASC
+        WHERE timestamp >= @since AND (@cursor IS NULL OR rowid > @cursor)
+        ORDER BY rowid ASC
         LIMIT @limit`
     )
     .all({
       since: sinceIso,
-      cursorTs,
-      cursorId,
+      cursor: parsed,
       limit: Math.max(1, Math.min(1000, Math.floor(limit) || 500)),
     }) as Array<Record<string, unknown>>;
   return rows.map((row) => ({
+    rowId: Number(row.row_id),
     id: String(row.id),
     correlationId: row.correlation_id ? String(row.correlation_id) : null,
     timestamp: String(row.timestamp),
