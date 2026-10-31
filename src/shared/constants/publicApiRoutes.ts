@@ -62,6 +62,8 @@ const PUBLIC_API_ROUTES_EXACT = new Set([
   // its own auth: `x-edge-secret` compared timing-safe against NEST_EDGE_SECRET
   // (401 otherwise). EXACT path, read-only counts only.
   "/api/internal/nest/outbox-status",
+  // T5.1：nest 成本回填只读导出（x-edge-secret 在路由内校验）
+  "/api/internal/nest/usage-export",
 ]);
 
 // Read-only single routes that ALSO take the CORS origin relaxation: they

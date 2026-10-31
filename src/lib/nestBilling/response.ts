@@ -7,6 +7,7 @@ import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 import { calculateCostDetailed } from "@/lib/usage/costCalculator";
 
 import { nestSettle } from "./client";
+import { setCallLogNestCostByCorrelation } from "@/lib/usage/callLogs";
 import { UsageAccumulator } from "./usageAccumulator";
 
 export interface NestBillingContext {
@@ -177,7 +178,7 @@ async function settleOnce(ctx: NestBillingContext, state: SettleState): Promise<
     }
   }
 
-  await nestSettle({
+  const settleResult = await nestSettle({
     ticket: ctx.ticket,
     status,
     usage: {
@@ -203,6 +204,16 @@ async function settleOnce(ctx: NestBillingContext, state: SettleState): Promise<
     model: ctx.model,
     units: ctx.units,
   });
+
+  // T5.1：把上游成本持久化到 call_logs，供 nest CostBackfill 回填（失败不影响结算）
+  if (settleResult.ok && upstreamCost != null) {
+    try {
+      const correlationId = state.requestId ?? ctx.requestId ?? null;
+      if (correlationId) setCallLogNestCostByCorrelation(correlationId, upstreamCost);
+    } catch {
+      // 成本落库失败不阻断结算；nest 侧仍标记 cost_pending，由下一轮导出重试
+    }
+  }
 }
 
 /** Wrap a chat response so its usage is settled exactly once. */
