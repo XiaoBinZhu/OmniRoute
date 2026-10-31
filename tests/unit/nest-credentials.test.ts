@@ -58,6 +58,11 @@ test("端点白名单：/v1 与 /api/v1 都命中 chat/messages，其它端点�
       "/v1/embeddings",
       "/v1/rerank",
       "/v1/moderations",
+      "/v1/images/generations",
+      "/v1/audio/speech",
+      "/v1/audio/transcriptions",
+      "/v1/audio/translations",
+      "/v1/videos/generations",
     ]
   );
   assert.equal(nestBilledEndpoint("http://localhost/v1/messages"), "/v1/messages");

@@ -46,6 +46,8 @@ export interface RunNestPreflightOptions {
   clientIp?: string | null;
   /** 错误体格式（/v1/messages 用 anthropic） */
   errorFormat?: "openai" | "anthropic";
+  /** T4.1 批 3：按次计价单位（图片张数等，1..100，缺省 1） */
+  units?: number;
 }
 
 export type RunNestPreflightOutcome =
@@ -115,6 +117,7 @@ export async function runNestPreflight(
     // T2.2：未显式传时读宿主 nginx 注入的 x-real-ip
     clientIp: opts.clientIp ?? request.headers.get("x-real-ip"),
     endpoint: opts.endpoint,
+    units: opts.units,
   });
   if (!preflight.ok) {
     return {
@@ -137,6 +140,7 @@ export async function runNestPreflight(
       requestId: opts.requestId,
       billingRequestId: preflight.billingRequestId ?? null,
       endpoint: opts.endpoint,
+      units: opts.units && opts.units > 1 ? opts.units : undefined,
     },
   };
 }

@@ -24,6 +24,10 @@ import { resolveModel } from "@omniroute/open-sse/services/wildcardRouter.ts";
 import { resolveModelAliasFromMap } from "@omniroute/open-sse/services/model.ts";
 import { isModelAllowedForKey } from "@/lib/db/apiKeys";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { generateRequestId } from "@/shared/utils/requestId";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { runNestPreflight } from "@/lib/nestBilling/guard";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -320,8 +324,34 @@ export async function POST(request) {
   }
   const modelStr = String(model);
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, modelStr);
+  // T4.1 批 3：Audio Transcriptions 接入边缘计费（multipart，按次 units=1）
+  let nestCtx: NestBillingContext | null = null;
+  {
+    const outcome = await runNestPreflight(
+      request,
+      { model: modelStr },
+      {
+        endpoint: "/v1/audio/transcriptions",
+        requestedModel: modelStr,
+        maxTokens: 1,
+        stream: false,
+        units: 1,
+        requestId:
+          resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+          generateRequestId(),
+        idempotencyKey: request.headers.get("x-idempotency-key"),
+        clientIp: request.headers.get("x-real-ip"),
+        errorFormat: "openai",
+      }
+    );
+    if (outcome.status === "rejection") return outcome.rejection;
+    if (outcome.status === "billing") nestCtx = outcome.ctx;
+  }
+
+  // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
+  const policy = nestCtx
+    ? { rejection: null, apiKeyInfo: null, apiKey: null }
+    : await enforceApiKeyPolicy(request, modelStr);
   if (policy.rejection) return policy.rejection;
 
   // Forwarded into transcribeWithModel() (and combo fan-out below) so the
@@ -333,7 +363,9 @@ export async function POST(request) {
   // the internal self-loop bearer, that of the caller key it names
   // (x-omniroute-self-loop-key-id, resolved by enforceApiKeyPolicy). null = the
   // key is not connection-scoped.
-  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  const scope = nestCtx
+    ? { rejection: null, allowedConnections: undefined }
+    : await resolveKeyConnectionScope(policy.apiKeyInfo);
   if (scope.rejection) return scope.rejection;
   const { allowedConnections } = scope;
 
@@ -353,7 +385,7 @@ export async function POST(request) {
           settings = getUserDatabaseSettings();
         } catch {}
 
-        return handleComboChat({
+        const comboResponse = await handleComboChat({
           body: { model: modelStr } as any,
           combo: combo as any,
           handleSingleModel: async (_reqBody: any, targetModelStr: string) =>
@@ -365,20 +397,21 @@ export async function POST(request) {
               apiKeyName,
               allowedConnections
             ),
-          isModelAvailable: createComboTargetKeyGate(policy, modelStr),
+          isModelAvailable: nestCtx ? async () => true : createComboTargetKeyGate(policy, modelStr),
           log,
           settings,
           allCombos: allCombos as any,
           relayOptions: undefined,
           signal: undefined,
         } as any);
+        return withNestBilling(comboResponse, nestCtx);
       }
     } catch (err) {
       log.error("AUDIO", `Combo resolution failed for ${modelStr}: ${err}`);
     }
   }
 
-  return transcribeWithAlias(
+  const transcribed = await transcribeWithAlias(
     formData,
     modelStr,
     startTime,
@@ -387,4 +420,5 @@ export async function POST(request) {
     policy.apiKey,
     allowedConnections
   );
+  return withNestBilling(transcribed, nestCtx);
 }
