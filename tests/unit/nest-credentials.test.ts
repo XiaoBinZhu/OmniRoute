@@ -47,8 +47,11 @@ test("凭据判定：sk- 与 JWT 命中，sk-ant-* 与非凭据串不命中", ()
   assert.equal(isNestBillingKeyCandidate(null), false);
 });
 
-test("端点白名单：/v1 与 /api/v1 都命中 chat，其它端点不命中", () => {
-  assert.deepEqual([...NEST_BILLED_ENDPOINTS], ["/v1/chat/completions"]);
+test("端点白名单：/v1 与 /api/v1 都命中 chat/messages，其它端点不命中", () => {
+  assert.deepEqual([...NEST_BILLED_ENDPOINTS], ["/v1/chat/completions", "/v1/messages"]);
+  assert.equal(nestBilledEndpoint("http://localhost/v1/messages"), "/v1/messages");
+  assert.equal(nestBilledEndpoint("http://localhost/api/v1/messages"), "/v1/messages");
+  assert.equal(nestBilledEndpoint("http://localhost/api/v1/messages/"), "/v1/messages");
   assert.equal(
     normalizeNestEndpointPath("http://localhost/api/v1/chat/completions/"),
     "/v1/chat/completions"
@@ -66,8 +69,15 @@ test("端点白名单：/v1 与 /api/v1 都命中 chat，其它端点不命中",
   assert.equal(nestBilledEndpoint("http://localhost/api/v1/models"), null);
   // 非端点路径（含无法构成绝对地址的串）一律不命中
   assert.equal(nestBilledEndpoint("not a url"), null);
-  // T3.3 之前 count_tokens 不在"只校验"白名单里
-  assert.equal(nestVerifyOnlyEndpoint("http://localhost/v1/messages/count_tokens"), null);
+  // T3.3：count_tokens 只校验不扣费
+  assert.equal(
+    nestVerifyOnlyEndpoint("http://localhost/v1/messages/count_tokens"),
+    "/v1/messages/count_tokens"
+  );
+  assert.equal(
+    nestVerifyOnlyEndpoint("http://localhost/api/v1/messages/count_tokens"),
+    "/v1/messages/count_tokens"
+  );
 });
 
 test("候选提取：陈旧的 Bearer sk-ant + 有效 x-api-key sk-nest → 只剩 sk-nest（N6）", () => {
