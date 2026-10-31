@@ -446,6 +446,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
   try {
     insertCallLogRow(prepared);
     inserted = true;
+    flushPendingNestCost(prepared.insertParams.id, prepared.insertParams.correlationId);
   } catch (error) {
     if (!isWriteLockError(error)) {
       logCallLogSaveFailure(error);
@@ -454,6 +455,7 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     const retry = scheduleWriteRetry(() => {
       insertCallLogRow(prepared);
       inserted = true;
+      flushPendingNestCost(prepared.insertParams.id, prepared.insertParams.correlationId);
     }, logCallLogSaveFailure);
     pendingCallLogSaves.add(retry);
     try {
@@ -994,9 +996,12 @@ export async function getCallLogs(filter: any = {}) {
   return rows.map(mapSummaryRow);
 }
 
+/** T5.1：settle 早于 call_logs 落库时的成本暂存（按 correlationId，容量上限防泄漏） */
+const pendingNestCost = new Map<string, number>();
+
 /**
  * T5.1：边缘结算后持久化上游成本（USD）。返回是否命中行（call_logs 可能晚于 settle 落库）。
- * 未命中时由调用方把成本暂存，待 saveCallLog 完成后再补写（见 nestBilling/response.ts）。
+ * 未命中时暂存到 pendingNestCost，由 saveCallLogOperation 落库后补写。
  */
 export function setCallLogNestCostByCorrelation(correlationId: string, costUsd: number): boolean {
   if (!correlationId || !Number.isFinite(costUsd) || costUsd < 0) return false;
@@ -1004,7 +1009,27 @@ export function setCallLogNestCostByCorrelation(correlationId: string, costUsd: 
   const res = db
     .prepare(`UPDATE call_logs SET nest_cost_usd = @cost WHERE correlation_id = @correlationId`)
     .run({ cost: costUsd, correlationId });
-  return Number(res.changes) > 0;
+  const hit = Number(res.changes) > 0;
+  if (!hit) {
+    if (pendingNestCost.size > 2000) pendingNestCost.clear();
+    pendingNestCost.set(correlationId, costUsd);
+  }
+  return hit;
+}
+
+/** 落库后补写暂存成本（由 saveCallLogOperation 调用） */
+function flushPendingNestCost(id: unknown, correlationId: unknown): void {
+  const key = typeof correlationId === "string" ? correlationId : "";
+  const rowId = typeof id === "string" ? id : "";
+  if (!key || !rowId) return;
+  const cost = pendingNestCost.get(key);
+  if (cost == null) return;
+  pendingNestCost.delete(key);
+  try {
+    setCallLogNestCostById(rowId, cost);
+  } catch {
+    // 补写失败不回填暂存（下一轮导出仍会带有相同 correlation 的 cost）
+  }
 }
 
 /** 按 call_logs.id 补写成本（saveCallLog 已完成后的兜底路径） */
