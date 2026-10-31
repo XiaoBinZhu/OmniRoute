@@ -17,6 +17,7 @@ import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
 import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
+import { runWithCallLogApiKeyContext } from "@/lib/usage/callLogApiKeyContext";
 import {
   createComboTargetKeyGate,
   keylessProviderRejection,
@@ -174,7 +175,6 @@ async function translateWithModel(
       duration: Date.now() - startTime,
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
-      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   } else if (response) {
     const errorText = await response
@@ -192,7 +192,6 @@ async function translateWithModel(
       error: errorText.slice(0, 500),
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
-      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   }
   return response;
@@ -313,13 +312,14 @@ async function postHandler(request) {
     }
   }
 
-  const translated = await translateWithModel(
-    formData,
-    modelStr,
-    startTime,
-    apiKeyId,
-    apiKeyName,
-    allowedConnections
+  const callLogCorrelationId =
+    getNestRequestId(request) ??
+    resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+    null;
+  const translated = await runWithCallLogApiKeyContext(
+    { apiKeyId, apiKeyName, correlationId: callLogCorrelationId },
+    () =>
+      translateWithModel(formData, modelStr, startTime, apiKeyId, apiKeyName, allowedConnections)
   );
   return translated;
 }

@@ -28,6 +28,7 @@ import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
 import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
+import { runWithCallLogApiKeyContext } from "@/lib/usage/callLogApiKeyContext";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -242,7 +243,6 @@ async function transcribeWithModel(
       responseBody: durationUsage ? { usage: durationUsage } : undefined,
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
-      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   } else if (response) {
     const errorText = await response
@@ -260,7 +260,6 @@ async function transcribeWithModel(
       error: errorText.slice(0, 500),
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
-      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   }
   return response;
@@ -420,14 +419,22 @@ async function postHandler(request) {
     }
   }
 
-  const transcribed = await transcribeWithAlias(
-    formData,
-    modelStr,
-    startTime,
-    apiKeyId,
-    apiKeyName,
-    policy.apiKey,
-    allowedConnections
+  const callLogCorrelationId =
+    getNestRequestId(request) ??
+    resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+    null;
+  const transcribed = await runWithCallLogApiKeyContext(
+    { apiKeyId, apiKeyName, correlationId: callLogCorrelationId },
+    () =>
+      transcribeWithAlias(
+        formData,
+        modelStr,
+        startTime,
+        apiKeyId,
+        apiKeyName,
+        policy.apiKey,
+        allowedConnections
+      )
   );
   return transcribed;
 }
