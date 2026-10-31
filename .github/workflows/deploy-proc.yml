@@ -88,20 +88,7 @@ jobs:
           set -euo pipefail
           # 每个已接入边缘计费的端点必须保留预检/结算包装。
           # Phase 3/4 已把 messages 与媒体端点切到 omniroute_direct，全部纳入断言。
-          files="""
-          src/app/api/v1/chat/completions/route.ts
-          src/app/api/v1/messages/route.ts
-          src/app/api/v1/responses/route.ts
-          src/app/api/v1/completions/route.ts
-          src/app/api/v1/embeddings/route.ts
-          src/app/api/v1/rerank/route.ts
-          src/app/api/v1/moderations/route.ts
-          src/app/api/v1/images/generations/route.ts
-          src/app/api/v1/audio/speech/route.ts
-          src/app/api/v1/audio/transcriptions/route.ts
-          src/app/api/v1/audio/translations/route.ts
-          src/app/api/v1/videos/generations/route.ts
-          """
+          files="src/app/api/v1/chat/completions/route.ts src/app/api/v1/messages/route.ts src/app/api/v1/responses/route.ts src/app/api/v1/completions/route.ts src/app/api/v1/embeddings/route.ts src/app/api/v1/rerank/route.ts src/app/api/v1/moderations/route.ts src/app/api/v1/images/generations/route.ts src/app/api/v1/audio/speech/route.ts src/app/api/v1/audio/transcriptions/route.ts src/app/api/v1/audio/translations/route.ts src/app/api/v1/videos/generations/route.ts"
           for f in $files; do
             if ! grep -qE "runNestPreflight|preflightWithCandidates" "$f"; then
               echo "::error::$f lost its nest preflight hook (billing would be skipped)"
