@@ -13,7 +13,7 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
-import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
+import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -125,6 +125,7 @@ async function postHandler(request, _context) {
         apiKeyName: policy.apiKeyInfo?.name || null,
         allowedConnections: scope.allowedConnections,
         isComboTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
+        correlationId: getNestRequestId(request) ?? generateRequestId(),
       }
     );
     return response;
@@ -145,6 +146,8 @@ type ValidatedRerankBody = {
 type RerankRequestMeta = {
   apiKeyId?: string | null;
   apiKeyName?: string | null;
+  /** T5.1：与 nest 日志一致的 correlationId（成本回填用） */
+  correlationId?: string | null;
   /** GHSA-3w2r: the caller key's connection scope (null/undefined = unscoped). */
   allowedConnections?: string[] | null;
   /** GHSA-3w2r: combo per-target model gate for the caller key (undefined = none). */
@@ -401,6 +404,7 @@ export async function handleValidatedRerankRequestBody(
             apiKeyName: meta.apiKeyName || undefined,
             requestedModel,
             comboName: meta.comboName || undefined,
+            correlationId: meta.correlationId || undefined,
           }).catch(() => {});
           return errorResponse(res.status, errorMessage);
         }
@@ -435,6 +439,7 @@ export async function handleValidatedRerankRequestBody(
           apiKeyName: meta.apiKeyName || undefined,
           requestedModel,
           comboName: meta.comboName || undefined,
+          correlationId: meta.correlationId || undefined,
         }).catch(() => {});
 
         const headers = new Headers({ ...CORS_HEADERS, "Content-Type": "application/json" });
@@ -464,6 +469,7 @@ export async function handleValidatedRerankRequestBody(
           apiKeyName: meta.apiKeyName || undefined,
           requestedModel,
           comboName: meta.comboName || undefined,
+          correlationId: meta.correlationId || undefined,
         }).catch(() => {});
         return errorResponse(500, `Rerank request failed: ${err.message}`);
       }

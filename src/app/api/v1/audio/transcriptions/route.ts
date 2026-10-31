@@ -27,7 +27,7 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
-import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
+import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -242,6 +242,7 @@ async function transcribeWithModel(
       responseBody: durationUsage ? { usage: durationUsage } : undefined,
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
+      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   } else if (response) {
     const errorText = await response
@@ -259,6 +260,7 @@ async function transcribeWithModel(
       error: errorText.slice(0, 500),
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
+      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   }
   return response;
