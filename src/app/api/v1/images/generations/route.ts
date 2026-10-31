@@ -21,6 +21,9 @@ import { isAllRateLimitedCredentials } from "@/app/api/v1/_shared/rateLimit";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -142,10 +145,34 @@ async function postHandler(request, context) {
   const body = validation.data;
   const startTime = Date.now();
 
+  // T4.1 批 3：Images 接入边缘计费（units = 请求张数 n）
+  let nestCtx: NestBillingContext | null = null;
+  {
+    const requestedUnits = Math.max(1, Math.min(10, Math.floor(Number(body.n) || 1)));
+    const outcome = await runNestPreflight(request, body, {
+      endpoint: "/v1/images/generations",
+      requestedModel: typeof body.model === "string" ? body.model : "",
+      maxTokens: 1,
+      stream: false,
+      units: requestedUnits,
+      requestId:
+        resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+        generateRequestId(),
+      idempotencyKey: request.headers.get("x-idempotency-key"),
+      clientIp: request.headers.get("x-real-ip"),
+      errorFormat: "openai",
+    });
+    if (outcome.status === "rejection") return outcome.rejection;
+    if (outcome.status === "billing") nestCtx = outcome.ctx;
+  }
+
   // Authenticate before policy enforcement. Policy checks intentionally allow
   // keyless local mode and assume the route has already rejected invalid keys.
-  const authRejection = await enforceClientApiRouteAuth(request);
-  if (authRejection) return authRejection;
+  // nest 凭据由预检校验，不再走本地 key 判定。
+  if (!nestCtx) {
+    const authRejection = await enforceClientApiRouteAuth(request);
+    if (authRejection) return authRejection;
+  }
 
   // Fail closed on the raw wire id before combo/alias/custom-node remapping can erase it.
   try {
@@ -160,12 +187,16 @@ async function postHandler(request, context) {
     throw error;
   }
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, body.model);
+  // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
+  const policy = nestCtx
+    ? { rejection: null, apiKeyInfo: null }
+    : await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
   // GHSA-3w2r: credential selection (direct, account fallback and per combo
   // target) stays inside the key's connection scope, the same scope chat applies.
-  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  const scope = nestCtx
+    ? { rejection: null, allowedConnections: undefined }
+    : await resolveKeyConnectionScope(policy.apiKeyInfo);
   if (scope.rejection) return scope.rejection;
   // Respect the authenticated API key's credential scope before checking model capabilities.
   const endpointMismatch = await getRequestedModelEndpointMismatch(body.model, "images");
@@ -185,7 +216,7 @@ async function postHandler(request, context) {
     const combo = await getComboByName(body.model as string);
     if (combo) {
       const { executeImageCombo } = await import("@omniroute/open-sse/services/imageCombo");
-      return executeImageCombo(
+      const comboResult = await executeImageCombo(
         body.model as string,
         body,
         {
@@ -193,12 +224,15 @@ async function postHandler(request, context) {
           policy,
           keyScope: {
             allowedConnections,
-            isTargetAllowed: createComboTargetKeyGate(policy, body.model as string),
+            isTargetAllowed: nestCtx
+              ? undefined
+              : createComboTargetKeyGate(policy, body.model as string),
           },
         },
         startTime,
         log
       );
+      return withNestBilling(comboResult, nestCtx);
     }
   }
 
@@ -444,10 +478,13 @@ async function postHandler(request, context) {
       latencyMs: Date.now() - startTime,
       requestId: generateRequestId(),
     });
-    return new Response(JSON.stringify((result as { data: unknown }).data), {
-      status: 200,
-      headers,
-    });
+    return withNestBilling(
+      new Response(JSON.stringify((result as { data: unknown }).data), {
+        status: 200,
+        headers,
+      }),
+      nestCtx
+    );
   }
 
   const errorPayload = toJsonErrorPayload(
@@ -460,7 +497,11 @@ async function postHandler(request, context) {
     typeof errorPayload?.error?.message === "string"
       ? errorPayload.error.message
       : "Image generation provider error";
-  return errorResponse((result as any).status, message);
+  const failed = errorResponse((result as any).status, message);
+  if (nestCtx) {
+    void nestSettle(nestAbortSettleInput(nestCtx, new Error(message)));
+  }
+  return failed;
 }
 
 const guardedPost = withInjectionGuard(postHandler);

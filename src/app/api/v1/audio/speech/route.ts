@@ -10,6 +10,9 @@ import { resolveDynamicAudioProviders } from "@/app/api/v1/_shared/audioProvider
 import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -60,12 +63,36 @@ async function postHandler(request, context) {
   const body = validation.data;
   const startTime = Date.now();
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, body.model);
+  // T4.1 批 3：Audio Speech 接入边缘计费（按次，units=1）
+  let nestCtx: NestBillingContext | null = null;
+  {
+    const outcome = await runNestPreflight(request, body, {
+      endpoint: "/v1/audio/speech",
+      requestedModel: typeof body.model === "string" ? body.model : "",
+      maxTokens: 1,
+      stream: false,
+      units: 1,
+      requestId:
+        resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+        generateRequestId(),
+      idempotencyKey: request.headers.get("x-idempotency-key"),
+      clientIp: request.headers.get("x-real-ip"),
+      errorFormat: "openai",
+    });
+    if (outcome.status === "rejection") return outcome.rejection;
+    if (outcome.status === "billing") nestCtx = outcome.ctx;
+  }
+
+  // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
+  const policy = nestCtx
+    ? { rejection: null, apiKeyInfo: null }
+    : await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
   // GHSA-3w2r: credential selection (direct and per combo target) stays inside
   // the key's connection scope, the same scope chat applies.
-  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  const scope = nestCtx
+    ? { rejection: null, allowedConnections: undefined }
+    : await resolveKeyConnectionScope(policy.apiKeyInfo);
   if (scope.rejection) return scope.rejection;
   // Respect the authenticated API key's credential scope before checking model capabilities.
   const endpointMismatch = await getRequestedModelEndpointMismatch(body.model, "audio-speech");
@@ -81,10 +108,11 @@ async function postHandler(request, context) {
     const combo = await getComboByName(body.model);
     if (combo) {
       const { executeSpeechCombo } = await import("@omniroute/open-sse/services/speechCombo");
-      return executeSpeechCombo(body.model, body, startTime, {
+      const comboResponse = await executeSpeechCombo(body.model, body, startTime, {
         allowedConnections,
-        isTargetAllowed: createComboTargetKeyGate(policy, body.model),
+        isTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
       });
+      return withNestBilling(comboResponse, nestCtx);
     }
   }
 
@@ -190,7 +218,16 @@ async function postHandler(request, context) {
       apiKeyName,
     }).catch(() => {});
   }
-  return response;
+  if (!response) {
+    if (nestCtx) {
+      void nestSettle(
+        nestAbortSettleInput(nestCtx, new Error("speech handler returned no response"))
+      );
+    }
+    return response;
+  }
+  // 错误响应由 withNestBilling 按 status>=400 自动退款（不重复 settle）
+  return withNestBilling(response, nestCtx);
 }
 
 export const POST = withInjectionGuard(postHandler);

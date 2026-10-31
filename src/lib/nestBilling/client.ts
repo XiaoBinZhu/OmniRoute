@@ -20,6 +20,8 @@ export interface NestPreflightInput {
   promptIncludesCache?: boolean;
   /** T3.4：规范化端点（缺省 /v1/chat/completions） */
   endpoint?: string;
+  /** T4.1 批 3：按次计价单位（图片张数等，1..100，缺省 1） */
+  units?: number;
 }
 
 export type NestPreflightResult =
@@ -62,6 +64,8 @@ export interface NestSettleInput {
   usageProvenance?: string | null;
   /** T3.4：规范化端点（/v1/chat/completions 等） */
   endpoint?: string | null;
+  /** T4.1 批 3：按次计价单位（图片张数等） */
+  units?: number;
   /** T2.1：请求模型（迟到结算时 ticket 已过期，nest 需要它重新计价） */
   model?: string | null;
 }
@@ -133,6 +137,8 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
         promptIncludesCache: input.promptIncludesCache === true,
         // T3.4：端点随 ticket 落库，settle 写日志时使用
         endpoint: input.endpoint ?? "/v1/chat/completions",
+        // T4.1 批 3：按次计价单位（图片张数等）
+        units: input.units ?? 1,
       }),
       signal: timeoutSignal(timeoutMs),
     });

@@ -53,6 +53,9 @@ export const NEST_BILLED_ENDPOINTS: ReadonlySet<string> = new Set<string>([
   "/v1/embeddings",
   "/v1/rerank",
   "/v1/moderations",
+  // T4.1 批 3（已接入）：Images / Audio Speech
+  "/v1/images/generations",
+  "/v1/audio/speech",
 ]);
 
 /** 只做校验不预扣的端点（T3.3 的 `count_tokens`）。 */

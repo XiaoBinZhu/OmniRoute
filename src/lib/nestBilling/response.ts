@@ -20,6 +20,8 @@ export interface NestBillingContext {
   billingRequestId?: string | null;
   /** T3.4：规范化端点（/v1/chat/completions → nest 日志与令牌白名单） */
   endpoint?: string;
+  /** T4.1 批 3：按次计价单位（图片张数等，缺省 1） */
+  units?: number;
 }
 
 export interface ParsedUsage {
@@ -199,6 +201,7 @@ async function settleOnce(ctx: NestBillingContext, state: SettleState): Promise<
     usageProvenance,
     endpoint: ctx.endpoint ?? null,
     model: ctx.model,
+    units: ctx.units,
   });
 }
 
