@@ -17,8 +17,9 @@ import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalog";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestSettle, type NestBillingContext } from "@/lib/nestBilling";
 import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 
 export const dynamic = "force-dynamic";
 
@@ -78,7 +79,10 @@ async function postHandler(request, context) {
     errorFormat: "openai",
   });
   if (outcome.status === "rejection") return outcome.rejection;
-  if (outcome.status === "billing") nestCtx = outcome.ctx;
+  if (outcome.status === "billing") {
+    nestCtx = outcome.ctx;
+    rememberNestCtx(request, nestCtx);
+  }
 
   try {
     // Auth check — when REQUIRE_API_KEY=false, ignore presented invalid keys
@@ -127,7 +131,7 @@ async function postHandler(request, context) {
       allowedConnections: scope.allowedConnections,
       isComboTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
     });
-    return withNestBilling(response, nestCtx);
+    return response;
   } catch (error) {
     if (nestCtx) {
       void nestSettle(nestAbortSettleInput(nestCtx, error));
@@ -136,4 +140,4 @@ async function postHandler(request, context) {
   }
 }
 
-export const POST = withInjectionGuard(postHandler);
+export const POST = withNestFinalize(withInjectionGuard(postHandler));

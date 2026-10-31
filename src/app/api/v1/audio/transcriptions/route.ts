@@ -25,8 +25,9 @@ import { resolveModelAliasFromMap } from "@omniroute/open-sse/services/model.ts"
 import { isModelAllowedForKey } from "@/lib/db/apiKeys";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
+import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -308,6 +309,10 @@ async function transcribeWithAlias(
  * OpenAI Whisper API compatible (multipart/form-data)
  */
 export async function POST(request) {
+  return withNestFinalize(postHandler)(request);
+}
+
+async function postHandler(request) {
   let formData;
   try {
     formData = await request.formData();
@@ -344,7 +349,10 @@ export async function POST(request) {
       }
     );
     if (outcome.status === "rejection") return outcome.rejection;
-    if (outcome.status === "billing") nestCtx = outcome.ctx;
+    if (outcome.status === "billing") {
+      nestCtx = outcome.ctx;
+      rememberNestCtx(request, nestCtx);
+    }
   }
 
   // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
@@ -403,7 +411,7 @@ export async function POST(request) {
           relayOptions: undefined,
           signal: undefined,
         } as any);
-        return withNestBilling(comboResponse, nestCtx);
+        return comboResponse;
       }
     } catch (err) {
       log.error("AUDIO", `Combo resolution failed for ${modelStr}: ${err}`);
@@ -419,5 +427,5 @@ export async function POST(request) {
     policy.apiKey,
     allowedConnections
   );
-  return withNestBilling(transcribed, nestCtx);
+  return transcribed;
 }
