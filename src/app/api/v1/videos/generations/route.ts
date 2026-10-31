@@ -13,6 +13,10 @@ import { errorResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
 import * as log from "@/sse/utils/logger";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { generateRequestId } from "@/shared/utils/requestId";
+import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
+import { withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { runNestPreflight } from "@/lib/nestBilling/guard";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -70,12 +74,36 @@ async function postHandler(request, context) {
   const body = parsed.body;
   const startTime = Date.now();
 
-  // Enforce API key policies (model restrictions + budget limits)
-  const policy = await enforceApiKeyPolicy(request, body.model);
+  // T4.1 批 3：Videos 接入边缘计费（异步任务，按次 units=1，终态结算）
+  let nestCtx: NestBillingContext | null = null;
+  {
+    const outcome = await runNestPreflight(request, body, {
+      endpoint: "/v1/videos/generations",
+      requestedModel: typeof body.model === "string" ? body.model : "",
+      maxTokens: 1,
+      stream: false,
+      units: 1,
+      requestId:
+        resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+        generateRequestId(),
+      idempotencyKey: request.headers.get("x-idempotency-key"),
+      clientIp: request.headers.get("x-real-ip"),
+      errorFormat: "openai",
+    });
+    if (outcome.status === "rejection") return outcome.rejection;
+    if (outcome.status === "billing") nestCtx = outcome.ctx;
+  }
+
+  // Enforce API key policies (model restrictions + budget limits); nest 路径由 nest 自身限额
+  const policy = nestCtx
+    ? { rejection: null, apiKeyInfo: null }
+    : await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
   // GHSA-3w2r: credential selection (direct and per combo target) stays inside
   // the key's connection scope, the same scope chat applies.
-  const scope = await resolveKeyConnectionScope(policy.apiKeyInfo);
+  const scope = nestCtx
+    ? { rejection: null, allowedConnections: undefined }
+    : await resolveKeyConnectionScope(policy.apiKeyInfo);
   if (scope.rejection) return scope.rejection;
   // Respect API key scope before rejecting incompatible model endpoints.
   const endpointMismatch = await getRequestedModelEndpointMismatch(body.model, "videos");
@@ -111,7 +139,7 @@ async function postHandler(request, context) {
     const combo = await getComboByName(body.model);
     if (combo) {
       const { executeVideoCombo } = await import("@omniroute/open-sse/services/videoCombo");
-      return withApiKeyContext(() =>
+      const comboResult = await withApiKeyContext(() =>
         executeVideoCombo(
           body.model,
           body,
@@ -121,13 +149,14 @@ async function postHandler(request, context) {
             mediaSink,
             keyScope: {
               allowedConnections,
-              isTargetAllowed: createComboTargetKeyGate(policy, body.model),
+              isTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
             },
           },
           startTime,
           log
         )
       );
+      return withNestBilling(comboResult, nestCtx);
     }
   }
 
@@ -211,19 +240,25 @@ async function postHandler(request, context) {
   );
 
   if (isMediaGenerationFailure(result)) {
-    return failedMediaGenerationResponse(result, "Video generation provider error");
+    return withNestBilling(
+      failedMediaGenerationResponse(result, "Video generation provider error"),
+      nestCtx
+    );
   }
 
   await clearRecoveredProviderState(credentials);
-  return successfulMediaGenerationResponse({
-    result: { data: result.data },
-    billingMode: "video",
-    provider,
-    model: body.model,
-    startTime,
-    duration: body.duration,
-    apiKeyId: policy.apiKeyInfo?.id,
-  });
+  return withNestBilling(
+    successfulMediaGenerationResponse({
+      result: { data: result.data },
+      billingMode: "video",
+      provider,
+      model: body.model,
+      startTime,
+      duration: body.duration,
+      apiKeyId: policy.apiKeyInfo?.id,
+    }),
+    nestCtx
+  );
 }
 
 export const POST = withInjectionGuard(postHandler);
