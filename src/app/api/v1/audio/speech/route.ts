@@ -13,7 +13,7 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { nestSettle, type NestBillingContext } from "@/lib/nestBilling";
 import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
-import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
+import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   isKeyScopeBlockedCredentials,
@@ -203,6 +203,7 @@ async function postHandler(request, context) {
       duration: Date.now() - startTime,
       apiKeyId,
       apiKeyName,
+      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   } else if (response) {
     const errorText = await response
@@ -220,6 +221,7 @@ async function postHandler(request, context) {
       error: errorText.slice(0, 500),
       apiKeyId,
       apiKeyName,
+      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   }
   if (!response) {

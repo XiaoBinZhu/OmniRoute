@@ -16,7 +16,7 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
 import { type NestBillingContext } from "@/lib/nestBilling";
 import { runNestPreflight } from "@/lib/nestBilling/guard";
-import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
+import { rememberNestCtx, withNestFinalize, getNestRequestId } from "@/lib/nestBilling/finalize";
 import {
   createComboTargetKeyGate,
   keylessProviderRejection,
@@ -174,6 +174,7 @@ async function translateWithModel(
       duration: Date.now() - startTime,
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
+      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   } else if (response) {
     const errorText = await response
@@ -191,6 +192,7 @@ async function translateWithModel(
       error: errorText.slice(0, 500),
       apiKeyId: apiKeyId || undefined,
       apiKeyName: apiKeyName || undefined,
+      correlationId: getNestRequestId(request) ?? generateRequestId(),
     }).catch(() => {});
   }
   return response;

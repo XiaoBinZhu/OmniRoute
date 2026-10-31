@@ -25,6 +25,13 @@ export function rememberNestCtx(request: Request, ctx: NestBillingContext | null
   (request as unknown as Record<string, unknown>)[CTX_KEY] = ctx;
 }
 
+/** T5.1：供 saveCallLog 写入与 nest 日志一致的 correlationId（= ctx.requestId） */
+export function getNestRequestId(request: Request): string | null {
+  const ctx = (request as unknown as Record<string, unknown>)[CTX_KEY] as
+    NestBillingContext | undefined;
+  return ctx?.requestId ?? null;
+}
+
 export function markNestFinalized(response: Response): Response {
   (response as unknown as Record<string, unknown>)[FINALIZED_KEY] = true;
   return response;
