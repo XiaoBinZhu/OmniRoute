@@ -41,7 +41,8 @@ export function withNestFinalize<TReq extends Request, TCtx>(
         NestBillingContext | undefined;
       if (!ctx || !response) return response;
       if ((response as unknown as Record<string, unknown>)[FINALIZED_KEY]) return response;
-      if (response.status >= 400) {
+      // 仅 2xx 视为成功结算；3xx/4xx/5xx 一律退款
+      if (response.status < 200 || response.status >= 300) {
         void nestSettle(
           nestAbortSettleInput(ctx, new Error(`pre_upstream_reject_${response.status}`))
         );

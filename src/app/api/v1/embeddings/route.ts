@@ -17,8 +17,8 @@ import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalog";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { resolveIncomingCorrelationId } from "@/shared/utils/correlationPreserve.ts";
-import { nestSettle, type NestBillingContext } from "@/lib/nestBilling";
-import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { type NestBillingContext } from "@/lib/nestBilling";
+import { runNestPreflight } from "@/lib/nestBilling/guard";
 import { rememberNestCtx, withNestFinalize } from "@/lib/nestBilling/finalize";
 
 export const dynamic = "force-dynamic";
@@ -133,9 +133,7 @@ async function postHandler(request, context) {
     });
     return response;
   } catch (error) {
-    if (nestCtx) {
-      void nestSettle(nestAbortSettleInput(nestCtx, error));
-    }
+    // 异常统一由 withNestFinalize 退款（不在此处 settle，避免重复请求）
     throw error;
   }
 }
