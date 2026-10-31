@@ -12,7 +12,14 @@
  * @module lib/nestBilling/preflight
  */
 
-import { nestPreflight, type NestPreflightInput, type NestPreflightResult } from "./client";
+import {
+  nestPreflight,
+  nestVerify,
+  type NestPreflightInput,
+  type NestPreflightResult,
+  type NestVerifyInput,
+  type NestVerifyResult,
+} from "./client";
 
 export type NestBillingModelShape = { parsedBodyIsRecord: boolean; model: string };
 
@@ -52,7 +59,40 @@ export async function preflightWithCandidates(
     last = await nestPreflight({ ...input, key: candidates[index] });
     if (last.ok) return last;
     const hasNextCandidate = index < candidates.length - 1;
-    if (last.status !== 401 || !hasNextCandidate) return last;
+    const status = (last as { status?: number }).status;
+    if (status !== 401 || !hasNextCandidate) return last;
+  }
+  return last;
+}
+
+/**
+ * 轻量校验的候选重试（T3.3）：只有 401（令牌无效）才换下一个候选，
+ * 其它状态（402 欠费/403 冻结/429 限流/5xx）都是确定结论。
+ */
+export async function nestVerifyWithCandidates(
+  candidates: readonly string[],
+  input: NestVerifyInput = {}
+): Promise<NestVerifyResult> {
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      status: 401,
+      message: "No nest credential candidate",
+      reason: "invalid_token",
+    };
+  }
+  let last: NestVerifyResult = {
+    ok: false,
+    status: 401,
+    message: "No nest credential candidate",
+    reason: "invalid_token",
+  };
+  for (let index = 0; index < candidates.length; index += 1) {
+    last = await nestVerify(candidates[index], input);
+    if (last.ok) return last;
+    const hasNextCandidate = index < candidates.length - 1;
+    const status = (last as { status?: number }).status;
+    if (status !== 401 || !hasNextCandidate) return last;
   }
   return last;
 }

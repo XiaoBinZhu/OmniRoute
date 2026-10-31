@@ -42,10 +42,16 @@ export function isNestBillingKeyCandidate(key: string | null | undefined): boole
  * 受 nest 计费的端点白名单（规范化后的路径）。
  * Phase 1 仅 chat；Phase 3 加 `/v1/messages`，Phase 4 逐批扩充。
  */
-export const NEST_BILLED_ENDPOINTS: ReadonlySet<string> = new Set<string>(["/v1/chat/completions"]);
+export const NEST_BILLED_ENDPOINTS: ReadonlySet<string> = new Set<string>([
+  "/v1/chat/completions",
+  // T3.2：Claude 协议（Claude Code / Anthropic SDK）
+  "/v1/messages",
+]);
 
-/** 只做校验不预扣的端点（T3.3 的 `count_tokens`）。Phase 1 为空。 */
-export const NEST_VERIFY_ONLY_ENDPOINTS: ReadonlySet<string> = new Set<string>();
+/** 只做校验不预扣的端点（T3.3 的 `count_tokens`）。 */
+export const NEST_VERIFY_ONLY_ENDPOINTS: ReadonlySet<string> = new Set<string>([
+  "/v1/messages/count_tokens",
+]);
 
 /**
  * 把请求 URL 规范化成 nest 端点路径：去掉尾斜杠，剥掉 `/api` 前缀

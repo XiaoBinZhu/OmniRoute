@@ -18,6 +18,8 @@ export interface NestPreflightInput {
   cacheReadTokens?: number;
   cacheWrite1hTokens?: number;
   promptIncludesCache?: boolean;
+  /** T3.4：规范化端点（缺省 /v1/chat/completions） */
+  endpoint?: string;
 }
 
 export type NestPreflightResult =
@@ -129,6 +131,8 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
         cacheReadTokens: input.cacheReadTokens ?? 0,
         cacheWrite1hTokens: input.cacheWrite1hTokens ?? 0,
         promptIncludesCache: input.promptIncludesCache === true,
+        // T3.4：端点随 ticket 落库，settle 写日志时使用
+        endpoint: input.endpoint ?? "/v1/chat/completions",
       }),
       signal: timeoutSignal(timeoutMs),
     });
@@ -182,6 +186,73 @@ export async function nestPreflight(input: NestPreflightInput): Promise<NestPref
       status: 503,
       message: `nest preflight unavailable: ${(error as Error)?.message ?? error}`,
       code: "billing_unavailable",
+      reason: "billing_unavailable",
+    };
+  }
+}
+
+export interface NestVerifyInput {
+  model?: string;
+  endpoint?: string;
+  clientIp?: string | null;
+}
+
+export type NestVerifyResult =
+  | { ok: true; userId?: number; tokenId?: number }
+  | { ok: false; status: number; message: string; reason?: string; code?: string };
+
+/**
+ * 轻量校验：POST /ai/edge/verify（T3.3）。只验令牌/冻结/IP/欠费，不预扣不计费。
+ * Never throws — 调用方翻译成错误体。
+ */
+export async function nestVerify(
+  key: string,
+  input: NestVerifyInput = {}
+): Promise<NestVerifyResult> {
+  if (!isNestBillingEnabled()) {
+    return {
+      ok: false,
+      status: 503,
+      message: "Nest billing is disabled",
+      reason: "billing_unavailable",
+    };
+  }
+  const { baseUrl, timeoutMs } = nestBillingConfig();
+  try {
+    const response = await fetch(`${baseUrl}/ai/edge/verify`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+        ...(input.clientIp ? { "x-real-ip": input.clientIp } : {}),
+      },
+      body: JSON.stringify({
+        model: input.model ?? "",
+        endpoint: input.endpoint ?? "/v1/messages/count_tokens",
+      }),
+      signal: timeoutSignal(timeoutMs),
+    });
+    const envelope = await readEnvelope(response);
+    if (!response.ok) {
+      const rawReason = envelope?.reason ?? envelope?.code;
+      const reason =
+        typeof rawReason === "string" && rawReason.trim() ? rawReason.trim() : undefined;
+      const rawMessage = typeof envelope?.message === "string" ? envelope.message.trim() : "";
+      return {
+        ok: false,
+        status: response.status,
+        message: rawMessage || `nest verify failed (${response.status})`,
+        reason,
+        code: reason,
+      };
+    }
+    const payload = envelope?.data ?? envelope;
+    return { ok: true, userId: payload?.userId, tokenId: payload?.tokenId };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 503,
+      message: `nest verify unavailable: ${(error as Error)?.message ?? error}`,
       reason: "billing_unavailable",
     };
   }

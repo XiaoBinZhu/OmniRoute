@@ -14,6 +14,62 @@ import { isCredentialDiagnosticSentinel } from "@/sse/services/credentialSentine
 import { safeResolveProxy } from "@/sse/handlers/chatHelpers";
 import * as log from "@/sse/utils/logger";
 import { isInputTokenCountPlausible } from "@omniroute/open-sse/utils/usageTracking.ts";
+import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
+import { resolveClientApiKey } from "@/sse/services/clientApiKeyResolver";
+import { nestBillingErrorResponse, isNestBillingEnabled } from "@/lib/nestBilling";
+import type { NestBillingErrorInput } from "@/lib/nestBilling/response";
+import { nestCredentialCandidates, nestVerifyOnlyEndpoint } from "@/lib/nestBilling/credentials";
+import { nestVerifyWithCandidates } from "@/lib/nestBilling/preflight";
+
+/**
+ * T3.3/N16：nest 令牌的 count_tokens 本地限流（按 tokenId，默认 60 rpm）。
+ * 单进程内存桶：OmniRoute 单容器部署下足够；多实例时是“每实例”上限，仍能挡住单点刷量。
+ */
+const COUNT_TOKENS_WINDOW_MS = 60_000;
+const countTokensWindows = new Map<number, { windowStart: number; count: number }>();
+
+function consumeCountTokensQuota(tokenId: number | undefined): {
+  allowed: boolean;
+  retryAfterSeconds: number;
+} {
+  const limit = Math.max(1, Number(process.env.NEST_COUNT_TOKENS_RPM ?? 60) || 60);
+  const key = tokenId ?? 0;
+  const now = Date.now();
+  const win = countTokensWindows.get(key);
+  if (!win || now - win.windowStart >= COUNT_TOKENS_WINDOW_MS) {
+    countTokensWindows.set(key, { windowStart: now, count: 1 });
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+  win.count += 1;
+  if (win.count > limit) {
+    return {
+      allowed: false,
+      retryAfterSeconds: Math.max(
+        1,
+        Math.ceil((win.windowStart + COUNT_TOKENS_WINDOW_MS - now) / 1000)
+      ),
+    };
+  }
+  return { allowed: true, retryAfterSeconds: 0 };
+}
+
+function anthropicRateLimited(retryAfterSeconds: number): Response {
+  return new Response(
+    JSON.stringify({
+      type: "error",
+      error: { type: "rate_limit_error", message: "请求过于频繁，请稍后重试" },
+    }),
+    {
+      status: 429,
+      headers: {
+        "Content-Type": "application/json",
+        ...CORS_HEADERS,
+        "x-should-retry": "true",
+        "retry-after": String(retryAfterSeconds),
+      },
+    }
+  );
+}
 
 /**
  * Handle CORS preflight
@@ -51,6 +107,33 @@ export async function POST(request) {
   };
   const estimated = buildEstimatedCountResponse(body, tokenizerContext);
   const requestedModel = typeof body.model === "string" ? body.model : "";
+
+  // T3.3/N16：nest 令牌的 count_tokens —— 只校验不扣费，且只做本地估算（不调用上游计数）。
+  const verifyEndpoint = nestVerifyOnlyEndpoint(request.url);
+  if (verifyEndpoint && isNestBillingEnabled()) {
+    const candidates = nestCredentialCandidates(request);
+    if (candidates.length > 0) {
+      const localKey = await resolveClientApiKey(request).catch(() => ({ valid: false }));
+      if (!localKey.valid) {
+        const verified = await nestVerifyWithCandidates(candidates, {
+          model: requestedModel,
+          endpoint: verifyEndpoint,
+          clientIp: request.headers.get("x-real-ip"),
+        });
+        if (!verified.ok) {
+          return nestBillingErrorResponse(verified as NestBillingErrorInput, "anthropic");
+        }
+        const quota = consumeCountTokensQuota(verified.tokenId);
+        if (!quota.allowed) return anthropicRateLimited(quota.retryAfterSeconds);
+        return estimated;
+      }
+    }
+  }
+
+  // Defense-in-depth（与其它路由一致）：非 nest 计费路径仍要过路由级鉴权。
+  const authRejection = await enforceClientApiRouteAuth(request);
+  if (authRejection) return authRejection;
+
   if (!requestedModel) {
     return estimated;
   }

@@ -35,6 +35,17 @@ export function nestBillingConfig(): {
 }
 
 /**
+ * A1（T3.4）：预扣估算的输出上限。Claude Code 常发 max_tokens 32000/64000，
+ * 满额预扣会误拒小余额用户；默认 8192，env `EDGE_ESTIMATE_COMPLETION_CAP` 可调。
+ * 非法/非正数一律回落默认值（与 nest 侧启动断言分工：那边只拒绝非法值，不在此报错）。
+ */
+export function edgeEstimateCompletionCap(env: EnvLike = process.env): number {
+  const raw = Number(String(env.EDGE_ESTIMATE_COMPLETION_CAP ?? "").trim());
+  if (!Number.isFinite(raw) || raw <= 0) return 8192;
+  return Math.floor(raw);
+}
+
+/**
  * Chat completions is the only route that participates in nest billing (Phase 1).
  * Delegates to the shared endpoint whitelist so `/api/v1/*` and `/v1/*` agree.
  */

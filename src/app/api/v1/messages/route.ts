@@ -27,6 +27,10 @@ import {
 } from "@/shared/services/bifrost/bifrostRouting.ts";
 import { dispatchToBifrost } from "@/shared/services/bifrost/bifrostClient.ts";
 import { gateBifrostFastPath } from "@/shared/services/bifrost/bifrostFastPathGate.ts";
+import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
+import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
+import { nestBilledEndpoint } from "@/lib/nestBilling/credentials";
+import { edgeEstimateCompletionCap } from "@/lib/nestBilling/config";
 
 // Bifrost's Anthropic-compatible endpoint (the Anthropic SDK integration, mounted under
 // /anthropic). The Anthropic-format body of /v1/messages must go here: posting it to the
@@ -186,33 +190,88 @@ async function postHandler(request: any, context: any, preParsedBody: any = null
   const accept = String(request.headers?.get?.("accept") || "");
   const wantsStreaming = resolveStreamFlag(body?.stream, accept, "claude");
 
-  // Bifrost sidecar fast-path (falls back to the native pipeline below on 5xx / error).
-  const relayBackend = resolveRelayRoutingBackend();
-  const bifrostConfig = getBifrostRoutingConfig();
-  const fastPathResult = await tryBifrostFastPath(request, body, bifrostConfig, relayBackend);
-  if (fastPathResult.response) {
-    return fastPathResult.response;
-  }
-  const applyHeaders = (res: Response) =>
-    applyBifrostHeaders(res, bifrostConfig, relayBackend, fastPathResult.fallbackHeader);
+  // T3.2：Claude 协议与 chat 走同一条边缘计费链路（runNestPreflight → withNestBilling）。
+  // 注意：`requestedModel` 取用户原始名（nest 侧负责别名/日期后缀），maxTokens 按 A1 截断。
+  let nestCtx: NestBillingContext | null = null;
+  const callerCorrelationId = resolveIncomingCorrelationId(request.headers.get("x-correlation-id"));
+  try {
+    const billingModel = typeof body?.model === "string" ? body.model.trim() : "";
+    const declaredMaxTokens = Number(body?.max_tokens ?? body?.max_completion_tokens ?? 0);
+    const nestOutcome = await runNestPreflight(request, body, {
+      endpoint: nestBilledEndpoint(request.url) ?? "/v1/messages",
+      requestedModel: billingModel,
+      maxTokens: Math.min(
+        Number.isFinite(declaredMaxTokens) && declaredMaxTokens > 0
+          ? Math.floor(declaredMaxTokens)
+          : 4096,
+        edgeEstimateCompletionCap()
+      ),
+      stream: wantsStreaming,
+      requestId: callerCorrelationId ?? generateRequestId(),
+      idempotencyKey: request.headers.get("x-idempotency-key"),
+      clientIp: request.headers.get("x-real-ip"),
+      errorFormat: "anthropic",
+    });
+    if (nestOutcome.status === "rejection") {
+      return nestOutcome.rejection;
+    }
+    if (nestOutcome.status === "billing") {
+      nestCtx = nestOutcome.ctx;
+    }
 
-  if (wantsStreaming) {
-    // Single id for handler + keepalive bytes + deadline warn (matches the
-    // chat/completions convention: caller id preserved, generated when absent).
-    const correlationId =
-      resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ?? generateRequestId();
-    const { signal: streamSignal, deadlineController } = createStreamDeadlineSignal(request.signal);
-    return applyHeaders(
-      await withEarlyStreamKeepalive(handleChat(request, null, body, correlationId, streamSignal), {
-        signal: streamSignal,
-        thresholdMs: resolveKeepaliveThreshold(body?.model),
-        keepaliveFrame: ANTHROPIC_PING_FRAME,
-        correlationId,
-        deadlineController,
-      })
+    // Bifrost sidecar fast-path (falls back to the native pipeline below on 5xx / error).
+    // IMPORTANT: never take this path for nest-billed requests — it answers before
+    // handleChat()/withNestBilling(), which would skip settle and the call log.
+    const relayBackend = resolveRelayRoutingBackend();
+    const bifrostConfig = getBifrostRoutingConfig();
+    const fastPathResult: { response?: Response; fallbackHeader?: string } = nestCtx
+      ? {}
+      : await tryBifrostFastPath(request, body, bifrostConfig, relayBackend);
+    if (fastPathResult.response) {
+      return fastPathResult.response;
+    }
+    const applyHeaders = (res: Response) =>
+      applyBifrostHeaders(res, bifrostConfig, relayBackend, fastPathResult.fallbackHeader);
+
+    if (wantsStreaming) {
+      // Single id for handler + keepalive bytes + deadline warn (matches the
+      // chat/completions convention: caller id preserved, generated when absent).
+      const correlationId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
+      const { signal: streamSignal, deadlineController } = createStreamDeadlineSignal(
+        request.signal
+      );
+      return applyHeaders(
+        withNestBilling(
+          await withEarlyStreamKeepalive(
+            handleChat(request, null, body, correlationId, streamSignal),
+            {
+              signal: streamSignal,
+              thresholdMs: resolveKeepaliveThreshold(body?.model),
+              keepaliveFrame: ANTHROPIC_PING_FRAME,
+              correlationId,
+              deadlineController,
+              // Claude Code 展示用；与 settle 的 omnirouteRequestId 同一个 id
+              extraHeaders: { "request-id": correlationId },
+            }
+          ),
+          nestCtx
+        )
+      );
+    }
+    const jsonReqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
+    const jsonResponse = applyHeaders(
+      withNestBilling(await handleChat(request, null, body, jsonReqId), nestCtx)
     );
+    if (!jsonResponse.headers.has("request-id")) {
+      jsonResponse.headers.set("request-id", jsonReqId);
+    }
+    return jsonResponse;
+  } catch (error) {
+    if (nestCtx) {
+      void nestSettle(nestAbortSettleInput(nestCtx, error));
+    }
+    throw error;
   }
-  return applyHeaders(await handleChat(request, null, body));
 }
 
 // `logger: null` — the guardrail registry re-evaluates this request inside

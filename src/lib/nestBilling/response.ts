@@ -4,7 +4,7 @@ import { countTextTokens, type TokenizerContext } from "@/shared/utils/tiktokenC
 import { OMNIROUTE_RESPONSE_HEADERS } from "@/shared/constants/headers";
 import { calculateCostDetailed } from "@/lib/usage/costCalculator";
 
-import { nestSettle, type NestPreflightResult } from "./client";
+import { nestSettle } from "./client";
 import { UsageAccumulator } from "./usageAccumulator";
 
 export interface NestBillingContext {
@@ -483,11 +483,23 @@ export function resolveBillingErrorMapping(
 }
 
 /**
+ * 错误体翻译所需的最小结构（比 Extract<NestPreflightResult,{ok:false}> 宽松，
+ * 避免在 strict:false 的仓库配置下因联合类型收窄失效而报错）。
+ */
+export interface NestBillingErrorInput {
+  status: number;
+  message: string;
+  code?: string;
+  reason?: string;
+  retryAfterSeconds?: number;
+}
+
+/**
  * 把预检失败翻译成客户端错误体。
  * `format` 默认 `openai`（向后兼容）；T3.2 的 `/v1/messages` 传 `anthropic`。
  */
 export function nestBillingErrorResponse(
-  result: Extract<NestPreflightResult, { ok: false }>,
+  result: NestBillingErrorInput,
   format: "openai" | "anthropic" = "openai"
 ): Response {
   const mapping = resolveBillingErrorMapping(result.reason ?? result.code, result.status);
