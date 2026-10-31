@@ -103,8 +103,12 @@ jobs:
           src/app/api/v1/videos/generations/route.ts
           """
           for f in $files; do
-            if ! grep -qE "withNestBilling|runNestPreflight|withNestFinalize|preflightWithCandidates" "$f"; then
-              echo "::error::$f lost its nest billing hook (billing would be skipped)"
+            if ! grep -qE "runNestPreflight|preflightWithCandidates" "$f"; then
+              echo "::error::$f lost its nest preflight hook (billing would be skipped)"
+              exit 1
+            fi
+            if ! grep -qE "withNestBilling|withNestFinalize" "$f"; then
+              echo "::error::$f lost its nest settle/finalize hook (usage would not be billed)"
               exit 1
             fi
           done
