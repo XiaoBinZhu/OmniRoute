@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { CORS_HEADERS } from "@/shared/utils/cors";
 
 import { countTextTokens, type TokenizerContext } from "@/shared/utils/tiktokenCounter";
@@ -507,6 +509,8 @@ export function nestBillingErrorResponse(
     ...CORS_HEADERS,
     "Content-Type": "application/json",
     "x-should-retry": mapping.shouldRetry ? "true" : "false",
+    // Claude Code 会展示 request-id；预检拒绝也带一个，便于对账排查
+    "request-id": randomUUID(),
   };
   if (mapping.shouldRetry && result.retryAfterSeconds && result.retryAfterSeconds > 0) {
     headers["Retry-After"] = String(Math.ceil(result.retryAfterSeconds));
