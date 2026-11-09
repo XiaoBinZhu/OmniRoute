@@ -66,8 +66,16 @@ services:
     ports:
       # Loopback only. Public traffic arrives through Nginx (see
       # config/deploy/nginx-omniroute.conf), never straight from the internet.
+      #
+      # The split-port API is deliberately NOT published. `API_HOST` is pinned to
+      # 127.0.0.1 below, so that server binds the container's own loopback and the
+      # DNAT from a published port to 172.x.x.x:20129 can never connect — the old
+      # `127.0.0.1:${PROD_API_PORT:-20131}:20129` mapping answered nothing (curl
+      # returned 000 on the host). Everything — dashboard, `/v1` and `/api` — is
+      # served on 20128, so the mapping is removed instead of staying silently
+      # dead. Set API_HOST=0.0.0.0 and re-add the mapping if a separately
+      # host-reachable API port is ever wanted.
       - "127.0.0.1:${PROD_DASHBOARD_PORT:-20130}:20128"
-      - "127.0.0.1:${PROD_API_PORT:-20131}:20129"
       - "127.0.0.1:${PROD_LIVE_WS_PORT:-20132}:20132"
     volumes:
       - data:/app/data
