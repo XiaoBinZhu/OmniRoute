@@ -47,6 +47,7 @@ import { ensureSemanticCacheDbBridge } from "@/lib/cache/semanticCacheDbBridge";
 import { nestSettle, withNestBilling, type NestBillingContext } from "@/lib/nestBilling";
 import { nestAbortSettleInput, runNestPreflight } from "@/lib/nestBilling/guard";
 import { nestBilledEndpoint } from "@/lib/nestBilling/credentials";
+import { maybeQueueQuotaSessionRecovery } from "@/lib/quota/quotaSessionRecovery";
 import {
   getBifrostRoutingConfig,
   resolveRelayRoutingBackend,
@@ -366,6 +367,9 @@ export async function POST(request) {
     // Bifrost Go sidecar fast-path routing check.
     // IMPORTANT: never take this path for nest-billed requests — it answers before
     // handleChat()/withNestBilling(), which would skip settle and the call log.
+    // #11739 / nest billing: one id for both the streaming and JSON paths, preferring
+    // the id fixed by the nest preflight so billing stays correlated.
+    const reqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
     const relayBackend = resolveRelayRoutingBackend();
     const bifrostConfig = getBifrostRoutingConfig();
     let fallbackHeaderValue: string | undefined = undefined;
@@ -431,7 +435,6 @@ export async function POST(request) {
     };
 
     if (wantsStreaming) {
-      const reqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
       const { signal: routeDeadlineSignal, deadlineController: routeDeadlineController } =
         createStreamDeadlineSignal(request.signal);
       // Wrap the real handler response, not the synthetic early-keepalive response. If the
@@ -458,12 +461,16 @@ export async function POST(request) {
       );
     }
 
-    const jsonReqId = nestCtx?.requestId ?? callerCorrelationId ?? generateRequestId();
+    const handlerResponse = await handleChat(request, null, parsedBody, reqId);
+    const recoveryResponse = await maybeQueueQuotaSessionRecovery({
+      request,
+      body: parsedBody,
+      response: handlerResponse,
+      endpoint: "chat/completions",
+    });
     return finishAdmission(
       withCompressionHeaderEcho(
-        applyFallbackHeaders(
-          withNestBilling(await handleChat(request, null, parsedBody, jsonReqId), nestCtx)
-        ),
+        applyFallbackHeaders(withNestBilling(recoveryResponse, nestCtx)),
         compressionRequestHeader
       )
     );

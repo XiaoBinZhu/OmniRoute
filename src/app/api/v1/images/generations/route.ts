@@ -1,3 +1,4 @@
+import { getFalCompatibilityPreparer } from "@/lib/fal/compatibility";
 import { handleImageGeneration } from "@omniroute/open-sse/handlers/imageGeneration.ts";
 import { getRequestedModelEndpointMismatch } from "@/lib/providerModels/modelEndpointGuard";
 import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
@@ -59,6 +60,7 @@ import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalo
 import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
 import { runImageRequestWithAccounting } from "@/lib/usage/imageRequestAccounting";
 import { executeImageWithCredentialFallback } from "@/sse/services/imageCredentialRetry";
+import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { AUTHZ_HEADER_PEER_LOCALITY } from "@/server/authz/headers";
 import {
   assertCommonChatGptWebModelAvailable,
@@ -224,6 +226,7 @@ async function postHandler(request, context) {
         body.model as string,
         body,
         {
+          prepareFalInput: getFalCompatibilityPreparer(),
           request,
           policy,
           keyScope: {
@@ -435,6 +438,7 @@ async function postHandler(request, context) {
           },
           () =>
             handleImageGeneration({
+              prepareFalInput: getFalCompatibilityPreparer(),
               body,
               credentials: attemptCredentials,
               log,
@@ -442,6 +446,18 @@ async function postHandler(request, context) {
               signal: request.signal,
               // #16260 — IMAGE_GENERATION_LONG_JOBS (default off): null keeps the default path.
               longJobs: getImageLongJobOptions(),
+              // Providers that refresh OAuth credentials mid-request persist them like chat does.
+              onCredentialsRefreshed: attemptCredentials?.connectionId
+                ? async (next: Record<string, unknown>) => {
+                    await updateProviderCredentials(attemptCredentials.connectionId, {
+                      accessToken: next.accessToken,
+                      refreshToken: next.refreshToken,
+                      expiresIn: next.expiresIn,
+                      expiresAt: next.expiresAt,
+                      providerSpecificData: next.providerSpecificData,
+                    });
+                  }
+                : undefined,
               clientHeaders: publicBaseUrlHeaders(request.headers),
               // Trusted "loopback"|"lan"|"remote" verdict stamped by the authz
               // pipeline from the real TCP peer (never the spoofable Host

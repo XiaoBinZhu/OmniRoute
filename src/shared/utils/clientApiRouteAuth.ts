@@ -30,6 +30,23 @@ import {
   nestCredentialCandidates,
   nestVerifyOnlyEndpoint,
 } from "@/lib/nestBilling/credentials";
+import {
+  anthropicErrorResponse,
+  isAnthropicMessagesPath,
+} from "@/shared/utils/anthropicErrorEnvelope";
+
+/** 401 in the caller's protocol shape: Anthropic envelope on /v1/messages, OpenAI elsewhere. */
+function unauthorizedResponse(request: Request, message: string): Response {
+  let pathname = "";
+  try {
+    pathname = new URL(request.url).pathname;
+  } catch {
+    // Unparseable URL: fall back to the OpenAI-compatible shape.
+  }
+  return isAnthropicMessagesPath(pathname)
+    ? anthropicErrorResponse(HTTP_STATUS.UNAUTHORIZED, "authentication_error", message)
+    : errorResponse(HTTP_STATUS.UNAUTHORIZED, message);
+}
 
 /**
  * Authenticate a client-API request at the route level.
@@ -53,14 +70,10 @@ export async function enforceClientApiRouteAuth(request: Request): Promise<Respo
     if (nestEndpoint && nestCredentialCandidates(request).length > 0) return null;
   }
   if (apiKeyRaw) {
-    return isRequireApiKeyEnabled()
-      ? errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key")
-      : null;
+    return isRequireApiKeyEnabled() ? unauthorizedResponse(request, "Invalid API key") : null;
   }
 
   if (await isDashboardSessionAuthenticated(request)) return null;
 
-  return isRequireApiKeyEnabled()
-    ? errorResponse(HTTP_STATUS.UNAUTHORIZED, "Authentication required")
-    : null;
+  return isRequireApiKeyEnabled() ? unauthorizedResponse(request, "Authentication required") : null;
 }
