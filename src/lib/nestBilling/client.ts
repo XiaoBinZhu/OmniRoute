@@ -330,7 +330,7 @@ function outboxBackoffMs(attempts: number): number {
   return Math.min(OUTBOX_MAX_DELAY_MS, OUTBOX_BASE_DELAY_MS * Math.pow(2, exponent));
 }
 
-/** Durable replay queue (SQLite, migration 215/216). Failure here must never break the response. */
+/** Durable replay queue (SQLite, migration 229/230). Failure here must never break the response. */
 export function enqueueOutbox(
   ticket: string,
   payload: string,

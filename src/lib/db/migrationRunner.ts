@@ -426,6 +426,13 @@ function ensureColumn(db: SqliteAdapter, tableName: string, columnName: string, 
   }
 }
 
+function triggerHasWhenClause(db: SqliteAdapter, triggerName: string): boolean {
+  const trigger = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+    .get(triggerName) as { sql: string } | undefined;
+  return trigger !== undefined && /\bWHEN\b/i.test(trigger.sql);
+}
+
 function isSchemaAlreadyApplied(
   db: SqliteAdapter,
   migration: { version: string; name: string }
@@ -466,11 +473,17 @@ function isSchemaAlreadyApplied(
       return hasColumn(db, "skills", "mode");
     case "028":
       return hasTable(db, "batches") && hasTable(db, "files");
-    case "215":
-      // Renumbered 213 → 214 → 215: upstream claimed 213 (api_key_preferred_connections)
-      // then 214 (call_logs_client_session_id). Databases that already applied the old
-      // 213/214 nest_billing carry the outbox table — never re-run it.
+    case "229":
+      // Renumbered 213 → 214 → 215 → 229: upstream claimed 213/214, then v3.8.54
+      // claimed 215-218 (team_cost_centers, team_cost_shapes, quota_recovery_tickets,
+      // proxy_subscription_mirror_urls). Databases that already applied an older
+      // nest_billing carry the outbox table — never re-run it. Do NOT key this on
+      // "215": upstream's 215_team_cost_centers must not be skipped on such DBs.
       return hasTable(db, "nest_billing_outbox");
+    case "230":
+      return hasColumn(db, "nest_billing_outbox", "next_attempt_at");
+    case "231":
+      return hasColumn(db, "call_logs", "nest_cost_usd");
     case "029":
       return hasColumn(db, "provider_connections", "max_concurrent");
     case "040":
@@ -598,6 +611,11 @@ function isSchemaAlreadyApplied(
         hasColumn(db, "provider_nodes", "daily_quota_reset_timezone") &&
         hasColumn(db, "provider_nodes", "daily_quota_reset_hour")
       );
+    case "178":
+      // 178 only exists to give memory_fts_au a WHEN clause. A released ledger slot
+      // (#18952) can replay it long after 203 rewrote that trigger, and the replay would
+      // drop 203's memory_id condition, which is what indexes new memories (#15707).
+      return triggerHasWhenClause(db, "memory_fts_au");
     case "179":
       // proxy_logs.upstream_status may already exist if ensureProxyLogsColumns ran first;
       // a bare ADD COLUMN would then throw. Renumbering the migration means renaming this case
@@ -624,9 +642,13 @@ function isSchemaAlreadyApplied(
       // would answer for another migration's schema and skip it.
       return hasColumn(db, "proxy_logs", "attempt_number");
     case "194":
-      // Same shape as 179/181/183/184/187: ensureProxyLogsColumns may have
-      // added headers_ms at boot. Keyed by version only.
-      return hasColumn(db, "proxy_logs", "headers_ms");
+      // 194 adds TWO timing columns. Boot-time ensureProxyLogsColumns can
+      // independently install either one; the presence of headers_ms alone
+      // must not mark first_chunk_ms as migrated. The migration runner can
+      // replay only the missing ADD COLUMN via stripExistingAddColumns.
+      return (
+        hasColumn(db, "proxy_logs", "headers_ms") && hasColumn(db, "proxy_logs", "first_chunk_ms")
+      );
     case "212":
       // Provider-reported cost columns (#16087, renumbered 206 -> 212: the 206 slot
       // went to 206_codex_wakeup_tasks first). A DB that already applied the old
