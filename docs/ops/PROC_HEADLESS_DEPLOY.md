@@ -280,17 +280,35 @@ the last `--keep` (default 3) release records.
 
 ## 7. Environment used by the compose file
 
-| variable                                                      | default                     | meaning                                             |
-| ------------------------------------------------------------- | --------------------------- | --------------------------------------------------- |
-| `OMNIROUTE_IMAGE`                                             | **required**                | immutable image ref (`:proc-<sha>`), never `latest` |
-| `OMNIROUTE_HEADLESS`                                          | `1`                         | `0` only with a full/dashboard image                |
-| `OMNIROUTE_MEMORY_MB`                                         | `768`                       | runtime V8 heap                                     |
-| `OMNIROUTE_MEM_LIMIT`                                         | `1280m`                     | container memory ceiling                            |
-| `OMNIROUTE_CPU_LIMIT`                                         | `1.5`                       | container CPU ceiling                               |
-| `PROD_DASHBOARD_PORT` / `PROD_API_PORT` / `PROD_LIVE_WS_PORT` | `20130` / `20131` / `20132` | loopback host ports                                 |
+| variable                                    | default           | meaning                                             |
+| ------------------------------------------- | ----------------- | --------------------------------------------------- |
+| `OMNIROUTE_IMAGE`                           | **required**      | immutable image ref (`:proc-<sha>`), never `latest` |
+| `OMNIROUTE_HEADLESS`                        | `1`               | `0` only with a full/dashboard image                |
+| `OMNIROUTE_MEMORY_MB`                       | `768`             | runtime V8 heap                                     |
+| `OMNIROUTE_MEM_LIMIT`                       | `1280m`           | container memory ceiling                            |
+| `OMNIROUTE_CPU_LIMIT`                       | `1.5`             | container CPU ceiling                               |
+| `PROD_DASHBOARD_PORT` / `PROD_LIVE_WS_PORT` | `20130` / `20132` | loopback host ports                                 |
+
+The split-port API (`API_PORT=20129`) is deliberately **not** published. `API_HOST` is pinned to
+`127.0.0.1` in the compose file, so that server binds the container's own loopback and a published
+port could never reach it (the old `127.0.0.1:20131` mapping answered nothing — `curl` returned
+`000` on the host). Dashboard, `/v1` and `/api` are all served on `20128`.
 
 The container also reads the host's `.env` (`env_file: .env`) — `JWT_SECRET`, `API_KEY_SECRET`,
 `INITIAL_PASSWORD`, `REQUIRE_API_KEY`, `DATA_DIR` and friends. Never commit that file.
+
+One key there is easy to miss and silently breaks per-client rate limiting when absent:
+`OMNIROUTE_TRUSTED_PROXY_CIDRS`. nginx reaches the container through Docker's published port, so
+the TCP peer is the bridge gateway (`172.19.0.1` for this stack) rather than loopback. With no
+subnet listed, `X-Forwarded-For` is ignored and every client collapses onto that one address — the
+per-IP login lockout then becomes a global bucket. Read the value this host actually uses:
+
+```
+docker network inspect omniroute-proc_default --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+```
+
+Confirm it is in effect with `docker exec omniroute printenv OMNIROUTE_TRUSTED_PROXY_CIDRS`, and
+confirm distinct clients are recorded in `audit_log.ip_address` (`/app/data/storage.sqlite`).
 
 ## 8. See also
 
