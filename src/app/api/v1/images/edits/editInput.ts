@@ -1,6 +1,11 @@
 import { z } from "zod";
 import { getCachedSettings } from "@/lib/db/readCache";
-import { extractImageEditInputFromJson } from "@/lib/images/imageRouteModel";
+import { getImageModelEntry } from "@omniroute/open-sse/config/imageRegistry.ts";
+import {
+  MAX_CODEX_IMAGE_EDIT_REFERENCES,
+  extractImageEditInputFromJson,
+  resolveRemoteImageEditReferences,
+} from "@/lib/images/imageRouteModel";
 import { getBodySizeLimit, readRequestBodyWithLimit } from "@/shared/middleware/bodySizeGuard";
 import * as log from "@/sse/utils/logger";
 
@@ -27,6 +32,15 @@ const ImageEditJsonSchema = z
     images: z.array(z.unknown()).optional(),
   })
   .passthrough();
+
+/** Keep larger prefetch only for a registered hosted Codex model, never GPT Image. */
+function hostedCodexReferenceLimit(model: string | undefined): number | undefined {
+  if (!model) return undefined;
+  const entry = getImageModelEntry(model);
+  return entry?.provider === "codex" && !/^gpt-image-/i.test(entry.model)
+    ? MAX_CODEX_IMAGE_EDIT_REFERENCES
+    : undefined;
+}
 
 async function readMultipartOptions(formData: FormData): Promise<Record<string, unknown>> {
   const options: Record<string, unknown> = {};
@@ -129,7 +143,15 @@ export async function readEditInput(request: Request): Promise<EditInput | null>
         log.warn("IMAGE", "Invalid JSON edit body shape");
         return null;
       }
-      const extracted = extractImageEditInputFromJson(parsed.data);
+      // Before model routing, only registered hosted Codex models opt in to
+      // 128 remote references. GPT Image and unresolved combos keep the
+      // conservative 16-reference prefetch guard.
+      const hostedMaxReferences = hostedCodexReferenceLimit(parsed.data.model);
+      const resolved = await resolveRemoteImageEditReferences(parsed.data, {
+        signal: request.signal,
+        maxReferences: hostedMaxReferences,
+      });
+      const extracted = extractImageEditInputFromJson(resolved);
       return extracted
         ? {
             ...extracted,

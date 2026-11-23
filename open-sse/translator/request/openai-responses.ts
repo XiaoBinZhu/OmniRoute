@@ -602,6 +602,11 @@ export function openaiResponsesToOpenAIRequest(
       if (!fnName) {
         continue;
       }
+      // Same as function_call (#2893): a call with a blank call_id can never be paired with its
+      // output, so skip it instead of re-pairing it later with a made-up id and an empty result.
+      if (!toString(item.call_id).trim()) {
+        continue;
+      }
       if (!currentAssistantMsg) {
         currentAssistantMsg = {
           role: "assistant",
@@ -625,7 +630,7 @@ export function openaiResponsesToOpenAIRequest(
         },
       });
       currentAssistantMsg.tool_calls = toolCalls;
-      if (toString(item.call_id).trim()) pendingCallIds.push(toString(item.call_id));
+      pendingCallIds.push(toString(item.call_id));
       continue;
     }
 
@@ -692,12 +697,16 @@ export function openaiResponsesToOpenAIRequest(
     // Skip Responses-only search metadata. tool_search_call/tool_search_result
     // are Codex's dynamic tool-discovery items; web_search_call is emitted by
     // OmniRoute's web-search fallback alongside function_call_output, which
-    // already carries the result for Chat Completions. Replayed metadata has no
-    // lossless Chat representation and must not fail a follow-up turn.
+    // already carries the result for Chat Completions. image_generation_call is
+    // the image the model made on an earlier turn (a base64 result the client
+    // replays). Replayed metadata has no lossless Chat representation and must
+    // not fail a follow-up turn. Other unrepresentable types (item_reference,
+    // mcp_call, computer_call_output) still throw: dropping them loses input.
     if (
       itemType === "tool_search_call" ||
       itemType === "tool_search_result" ||
-      itemType === "web_search_call"
+      itemType === "web_search_call" ||
+      itemType === "image_generation_call"
     ) {
       continue;
     }
@@ -934,6 +943,12 @@ export function openaiResponsesToOpenAIRequest(
     ];
   });
 
+  // Upstream providers reject messages:[] (see the empty-input placeholder above). Skipped
+  // replay items or dropped tool results can still leave nothing: keep the same placeholder.
+  if (Array.isArray(result.messages) && result.messages.length === 0) {
+    result.messages = [{ role: "user", content: "..." }];
+  }
+
   // Translate tool_choice object format: Responses {type,name} → Chat {type,function:{name}}
   if (
     result.tool_choice &&
@@ -1027,15 +1042,12 @@ export function openaiResponsesToOpenAIRequest(
     }
   }
 
-  // #12141: When translated Chat tools is empty/absent, strip neutral tool_choice
-  // ("auto" / "none") so strict Chat endpoints (e.g. vLLM) do not reject with 400
-  // ("When using tool_choice, tools must be set"). Contradictory choices like "required"
-  // or forced functions are preserved so the upstream error remains visible.
+  // #12141: Strip dangling "auto" for strict Chat endpoints without tools.
+  // Explicit "none" forbids more tool calls, including after a tool loop;
+  // preserve it even when there are no definitions. Contradictory "required"
+  // or forced-function choices retain their existing upstream-error behavior.
   const finalChatTools = Array.isArray(result.tools) ? result.tools : [];
-  if (
-    finalChatTools.length === 0 &&
-    (result.tool_choice === "auto" || result.tool_choice === "none")
-  ) {
+  if (finalChatTools.length === 0 && result.tool_choice === "auto") {
     delete result.tool_choice;
   }
 
@@ -1045,7 +1057,11 @@ export function openaiResponsesToOpenAIRequest(
   // prompt caching (#517). But #517's fix never added a provider gate, so it leaked to
   // every destination, OpenAI or not — a strict non-OpenAI upstream (NVIDIA) 400s on the
   // unrecognized field (#7533). Strip it for any non-OpenAI destination.
-  if (!isOpenAIDestination) delete result.prompt_cache_key;
+  // `conversation_id` is the same kind of session field (Codex reads it), so it follows the same gate.
+  if (!isOpenAIDestination) {
+    delete result.prompt_cache_key;
+    delete result.conversation_id;
+  }
   delete result.input;
   delete result.instructions;
   delete result.include;

@@ -24,17 +24,32 @@ import { guardHostConfigTarget } from "../utils/config-home-guard.mjs";
 import { detectLocalCliProvider } from "../utils/localCliAvailability.mjs";
 import { loadAvailableProviders } from "../provider-catalog.mjs";
 import { isLoopbackUrl } from "../api.mjs";
+import { claudeWindowEnv } from "../utils/claudeWindowEnv.mjs";
 import {
   categoriseModel,
   isCodexCompatibleTextModel,
   profileNameFromModelId,
 } from "./setup-codex.mjs";
 
-/** Map a Codex-style effort to a Claude Code settings.json effortLevel. */
-function effortLevelFor(cfg) {
-  // Codex categories use xhigh/high/low/undefined; Claude Code accepts the same
-  // names (low|medium|high|xhigh). Pass through, omit for the "simple" tier.
-  return cfg.effort || undefined;
+// Claude Code effortLevel values, lowest first. `minimal`/`none` are catalog tiers but not
+// Claude Code levels, so they are never a clamp target.
+const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+
+/**
+ * Map a Codex-style effort to a Claude Code settings.json effortLevel.
+ * Codex categories use xhigh/high/low/undefined; Claude Code accepts the same names. Omitted
+ * for the "simple" tier. When the catalog row lists the model's `effort_tiers`, a level it
+ * does not offer is lowered to the highest listed level below it, and omitted when none fits.
+ */
+function effortLevelFor(cfg, effortTiers) {
+  const wanted = cfg?.effort || undefined;
+  const tiers = Array.isArray(effortTiers) ? effortTiers : [];
+  if (!wanted || tiers.length === 0 || tiers.includes(wanted)) return wanted;
+  const rank = CLAUDE_EFFORT_LEVELS.indexOf(wanted);
+  if (rank < 0) return wanted;
+  return CLAUDE_EFFORT_LEVELS.slice(0, rank)
+    .reverse()
+    .find((level) => tiers.includes(level));
 }
 
 /**
@@ -94,27 +109,40 @@ export function inheritedAnthropicKeyWarning(env = process.env) {
   if (!key || !String(key).trim()) return null;
   return (
     "ANTHROPIC_API_KEY is set in this shell. Claude Code sends it as x-api-key and asks " +
-    "\"Detected a custom API key in your environment\" — if ANTHROPIC_BASE_URL is not " +
+    '"Detected a custom API key in your environment" — if ANTHROPIC_BASE_URL is not ' +
     "picked up, that key goes to api.anthropic.com and you get a real Anthropic 401. " +
     "Unset it, or use `omniroute launch --profile <name>` (it strips every inherited " +
     "ANTHROPIC_* var before spawning claude)."
   );
 }
 
-/** Build the settings.json content for one Claude Code profile. */
-export function buildProfileSettings(modelId, baseUrl, cfg) {
+/**
+ * Build the settings.json content for one Claude Code profile.
+ * `contextWindow` is the model's real window from the catalog; without it the profile table's
+ * `cfg.ctx` is used. The window rule (compact at 85% below 200k, else 190000) is the one
+ * `omniroute launch` applies; it lives in claudeWindowEnv, shared by both.
+ * `effortTiers` is the catalog row's `capabilities.effort_tiers`; it keeps `effortLevel` within
+ * the levels the model offers.
+ */
+export function buildProfileSettings(modelId, baseUrl, cfg, contextWindow, effortTiers) {
+  const window = claudeWindowEnv(contextWindow ?? cfg?.ctx);
   const env = {
     ANTHROPIC_BASE_URL: baseUrl,
     ANTHROPIC_MODEL: modelId,
     CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: "1",
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW: "190000",
+    ...(window.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+      ? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: window.CLAUDE_CODE_AUTO_COMPACT_WINDOW }
+      : {}),
+    ...(window.CLAUDE_CODE_MAX_CONTEXT_TOKENS
+      ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: window.CLAUDE_CODE_MAX_CONTEXT_TOKENS }
+      : {}),
   };
   const settings = {
     $schema: "https://json.schemastore.org/claude-code-settings.json",
     model: modelId,
     env,
   };
-  const effort = effortLevelFor(cfg);
+  const effort = effortLevelFor(cfg, effortTiers);
   if (effort) settings.effortLevel = effort;
   // NOTE: ANTHROPIC_AUTH_TOKEN is intentionally NOT written here — `omniroute
   // launch --profile` injects it from the active context, keeping the secret off
@@ -217,7 +245,11 @@ export async function syncClaudeProfilesFromModels(models, opts = {}) {
 
     const dir = join(profilesRoot, cfg.name);
     const filePath = join(dir, "settings.json");
-    const content = buildProfileSettings(id, baseUrl, cfg);
+    // Same order as `omniroute launch`: max_input_tokens, then context_length.
+    const catalogWindow =
+      typeof m === "string" ? undefined : (m.max_input_tokens ?? m.context_length);
+    const effortTiers = typeof m === "string" ? undefined : m.capabilities?.effort_tiers;
+    const content = buildProfileSettings(id, baseUrl, cfg, catalogWindow, effortTiers);
 
     if (dryRun) {
       log(`\n── [dry-run] ${filePath} ──`);

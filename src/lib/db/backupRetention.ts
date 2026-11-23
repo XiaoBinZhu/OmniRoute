@@ -9,6 +9,7 @@
  * snapshots and `db_backups/` grew without bound (observed: 48,999 files / 204 GB).
  */
 
+import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 
@@ -243,6 +244,117 @@ export function collectBackupFamilies(backupDir: string): BackupFamily[] {
   );
 }
 
+const LEASE_PREFIX = ".migration-lease-";
+// shortcut: liveness is a pid check on this host, so a reused pid looks alive and another pid
+// namespace looks dead; the age bound caps the first case, move to a lock file if the second shows up.
+const LEASE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function isProcessAlive(pid: unknown): boolean {
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: unknown) {
+    return (err as NodeJS.ErrnoException | null)?.code === "EPERM";
+  }
+}
+
+/**
+ * Pin an in-flight migration restore point. Pruning in any process skips a leased family
+ * until the returned release runs, so count and age retention cannot delete the snapshot
+ * a running upgrade may still restore from. A lease of a dead or day-old owner is ignored.
+ */
+export function acquireSnapshotLease(backupDir: string, snapshotPath: string): () => void {
+  const parent = path.basename(path.dirname(snapshotPath));
+  const base = portableSnapshotId(parent) ?? path.basename(snapshotPath);
+  const file = path.join(backupDir, `${LEASE_PREFIX}${process.pid}-${randomUUID()}.json`);
+  // Write then rename, so a reader never sees half a lease.
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify({ pid: process.pid, base }), { mode: 0o600 });
+  fs.renameSync(`${file}.tmp`, file);
+  return () => {
+    unlinkSyncWithRetry(file);
+  };
+}
+
+function readLeasedBases(backupDir: string): Set<string> {
+  const bases = new Set<string>();
+  for (const name of fs.readdirSync(backupDir)) {
+    if (!name.startsWith(LEASE_PREFIX) || name.endsWith(".tmp")) continue;
+    const file = path.join(backupDir, name);
+    try {
+      const lease = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: number; base?: string };
+      if (Date.now() - fs.statSync(file).mtimeMs < LEASE_MAX_AGE_MS && isProcessAlive(lease.pid)) {
+        if (lease.base) bases.add(lease.base);
+        continue;
+      }
+      unlinkSyncWithRetry(file); // the owner is gone: drop its lease
+    } catch {
+      // Unreadable or vanished lease: it neither pins nor gets deleted here.
+    }
+  }
+  return bases;
+}
+
+const SNAPSHOT_TEMP_PREFIX = ".migration-snapshot-";
+const SNAPSHOT_TEMP_FILE = "snapshot.sqlite";
+// A killed `VACUUM INTO` can leave this rollback journal next to the temp snapshot.
+const SNAPSHOT_TEMP_NAMES = new Set([SNAPSHOT_TEMP_FILE, `${SNAPSHOT_TEMP_FILE}-journal`]);
+/** A live snapshot writer touches its temp file or directory far more often than this. */
+export const STALE_SNAPSHOT_TEMP_MS = 60 * 60 * 1000;
+
+/**
+ * Remove `.migration-snapshot-*` temp directories that a killed upgrade left behind, so the
+ * scheduled backup prune (which pauses while one exists) can run again. Only a directory this
+ * process user owns, that holds nothing but `snapshot.sqlite` and its `-journal`, and that nothing wrote to for
+ * `maxIdleMs`, is removed. Anything else is left alone. The directory name carries no process
+ * id, so write recency is the liveness signal. Returns how many directories were removed.
+ */
+export function removeStaleSnapshotTemps(
+  backupDir: string,
+  maxIdleMs = STALE_SNAPSHOT_TEMP_MS
+): number {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(backupDir);
+  } catch {
+    return 0;
+  }
+
+  let removed = 0;
+  for (const name of entries) {
+    if (!name.startsWith(SNAPSHOT_TEMP_PREFIX)) continue;
+    try {
+      if (!removeStaleSnapshotTemp(path.join(backupDir, name), maxIdleMs)) continue;
+      removed++;
+      console.warn(`[Cleanup] Removed stale migration snapshot temp directory: ${name}`);
+    } catch (err) {
+      console.warn(`[Cleanup] Could not remove snapshot temp directory ${name}:`, err);
+    }
+  }
+  return removed;
+}
+
+/** Removes one temp directory when it is ours, holds only the snapshot file (and its journal), and is idle. */
+function removeStaleSnapshotTemp(dir: string, maxIdleMs: number): boolean {
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory()) return false;
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return false;
+
+  const children = fs.readdirSync(dir);
+  if (children.some((child) => !SNAPSHOT_TEMP_NAMES.has(child))) return false;
+  let newestMs = stat.mtimeMs;
+  for (const child of children) {
+    const childStat = fs.lstatSync(path.join(dir, child));
+    if (!childStat.isFile()) throw new Error("not a regular file");
+    newestMs = Math.max(newestMs, childStat.mtimeMs);
+  }
+  if (Date.now() - newestMs < maxIdleMs) return false;
+
+  for (const child of children) fs.unlinkSync(path.join(dir, child));
+  fs.rmdirSync(dir);
+  return true;
+}
+
 export type PruneResult = {
   deletedBackupFamilies: number;
   deletedFiles: number;
@@ -308,11 +420,21 @@ function removeEmptyPortableDirectory(backupDir: string, directory?: string): vo
   }
 }
 
+/** Unlink every file of one family; returns how many went. An emptied portable directory goes too. */
+function deleteFamilyFiles(backupDir: string, family: BackupFamily): number {
+  let deleted = 0;
+  for (const name of family.files) {
+    if (unlinkSyncWithRetry(path.join(backupDir, name))) deleted += 1;
+  }
+  if (deleted > 0) removeEmptyPortableDirectory(backupDir, family.directory);
+  return deleted;
+}
+
 /**
  * Delete backup families beyond `maxFiles` (newest kept), older than `retentionDays`
  * (0 disables the age rule), or orphaned (sidecars whose primary is already gone).
  * Families in `exemptBases` skip the age rule only; `maxFiles` and orphan rules
- * still apply to them.
+ * still apply to them. Families under a live snapshot lease are never deleted.
  */
 export function pruneBackupDirectory(options: {
   backupDir: string;
@@ -335,6 +457,7 @@ export function pruneBackupDirectory(options: {
   }
 
   const cutoffMs = retentionDays > 0 ? Date.now() - retentionDays * 24 * 60 * 60 * 1000 : 0;
+  const leasedBases = readLeasedBases(backupDir);
   const families = collectBackupFamilies(backupDir);
   const primaryFamilies = families
     .filter((family) => family.hasPrimary)
@@ -345,24 +468,16 @@ export function pruneBackupDirectory(options: {
   let deletedFiles = 0;
 
   for (const family of families) {
+    if (leasedBases.has(family.base)) continue;
     const isOverflowPrimary = family.hasPrimary && !keepPrimaryBases.has(family.base);
     const isExempt = options.exemptBases?.has(family.base) ?? false;
     const isExpired = retentionDays > 0 && !isExempt && family.latestMtimeMs < cutoffMs;
     const isOrphan = !family.hasPrimary;
     if (!isOverflowPrimary && !isExpired && !isOrphan) continue;
 
-    let anyDeletedInFamily = false;
-    for (const name of family.files) {
-      const deleted = unlinkSyncWithRetry(path.join(backupDir, name));
-      if (deleted) {
-        deletedFiles += 1;
-        anyDeletedInFamily = true;
-      }
-    }
-    if (anyDeletedInFamily) {
-      removeEmptyPortableDirectory(backupDir, family.directory);
-      deletedBackupFamilies += 1;
-    }
+    const deleted = deleteFamilyFiles(backupDir, family);
+    deletedFiles += deleted;
+    if (deleted > 0) deletedBackupFamilies += 1;
   }
 
   return {

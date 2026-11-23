@@ -85,6 +85,8 @@ import {
   type ApiKeyPermissionsUpdate,
 } from "./apiKeys/permissionsUpdate";
 import { getModelCatalogCacheVersion, invalidateModelCatalogCache } from "./readCache";
+import { KeyTemplateError } from "./keyTemplates/errors.ts";
+import type { KeyTemplatePolicy } from "@/shared/types/keyTemplates";
 import type { AccessSchedule, RateLimitRule } from "./apiKeys/types";
 
 // ──────────────── Performance Optimizations ────────────────
@@ -146,6 +148,7 @@ interface ApiKeyMetadata {
   usageLimitEnabled: boolean;
   dailyUsageLimitUsd: number | null;
   weeklyUsageLimitUsd: number | null;
+  fiveHourUsageLimitUsd: number | null;
   chaosModeEnabled: boolean;
   compressionEnabled: boolean;
   allowAutoCombos: boolean;
@@ -199,6 +202,8 @@ interface ApiKeyRow extends JsonRecord {
   dailyUsageLimitUsd?: unknown;
   weekly_usage_limit_usd?: unknown;
   weeklyUsageLimitUsd?: unknown;
+  five_hour_usage_limit_usd?: unknown;
+  fiveHourUsageLimitUsd?: unknown;
   chaos_mode_enabled?: unknown;
   chaosModeEnabled?: unknown;
   compression_enabled?: unknown;
@@ -261,6 +266,7 @@ interface ApiKeyView extends JsonRecord {
   usageLimitEnabled?: boolean;
   dailyUsageLimitUsd?: number | null;
   weeklyUsageLimitUsd?: number | null;
+  fiveHourUsageLimitUsd?: number | null;
   chaosModeEnabled?: boolean;
   compressionEnabled: boolean;
   allowAutoCombos: boolean;
@@ -281,8 +287,11 @@ export interface ApiKeyLookupOptions {
 // LRU cache for API key validation (valid keys only)
 const _keyValidationCache = new Map<string, { valid: boolean; timestamp: number }>();
 const _keyMetadataCache = new Map<string, CacheEntry<ApiKeyMetadata>>();
+// Keys with no row at all: hash -> time seen. Own map, so a flood of bad keys cannot evict valid entries.
+const _unknownKeyCache = new Map<string, number>();
 const _lastUsedUpdateCache = new Map<string, number>();
 const CACHE_TTL = 60 * 1000; // 1 minute TTL
+const UNKNOWN_KEY_TTL = 30 * 1000;
 const LAST_USED_UPDATE_TTL = 5 * 60 * 1000;
 const MAX_CACHE_SIZE = 1000;
 const EXCLUSIVE_LEASE_SCOPE = "lease:exclusive";
@@ -314,6 +323,7 @@ let _stmtDeleteKey: ApiKeysStatements["deleteKey"] | null = null;
 function invalidateCaches() {
   _keyValidationCache.clear();
   _keyMetadataCache.clear();
+  _unknownKeyCache.clear();
   clearModelPermissionCache();
   _lastUsedUpdateCache.clear();
 }
@@ -507,7 +517,7 @@ function getPreparedStatements(db: ApiKeysDbLike): ApiKeysStatements {
       "SELECT id, expires_at, revoked_at, is_active, is_banned FROM api_keys WHERE key_hash = ?"
     );
     _stmtGetKeyMetadata = db.prepare<ApiKeyRow>(
-      "SELECT id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, preferred_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, codex_service_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, chaos_mode_enabled, compression_enabled, allow_auto_combos, allow_cc_discovery_aliases, catalog_scope, forced_model, proxy_id FROM api_keys WHERE key_hash = ?"
+      "SELECT id, name, machine_id, model_access_mode, allowed_models, blocked_models, allowed_combos, allowed_connections, preferred_connections, allowed_quotas, no_log, auto_resolve, is_active, access_schedule, max_requests_per_day, max_requests_per_minute, throttle_delay_ms, max_sessions, revoked_at, expires_at, ip_allowlist, scopes, rate_limits, is_banned, key_hash, allowed_endpoints, stream_default_mode, cache_default_mode, codex_service_mode, disable_non_public_models, allow_usage_command, usage_limit_enabled, daily_usage_limit_usd, weekly_usage_limit_usd, five_hour_usage_limit_usd, chaos_mode_enabled, compression_enabled, allow_auto_combos, allow_cc_discovery_aliases, catalog_scope, forced_model, proxy_id FROM api_keys WHERE key_hash = ?"
     );
     _stmtInsertKey = db.prepare(
       "INSERT INTO api_keys (id, name, key, machine_id, model_access_mode, allowed_models, allowed_combos, allowed_connections, preferred_connections, no_log, created_at, key_prefix, key_hash, scopes, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -812,6 +822,8 @@ export async function createApiKey(
   };
 
   const stmt = getPreparedStatements(db);
+  const keyHash = await hashKey(apiKey.key);
+  _unknownKeyCache.delete(keyHash);
   // The secret is stored through the enc:v1: envelope (reversible for the admin reveal and
   // the operator export); auth matches key_hash only. See apiKeys/secretAtRest.ts.
   stmt.insertKey.run(
@@ -827,7 +839,7 @@ export async function createApiKey(
     0,
     apiKey.createdAt,
     apiKey.key.slice(0, 12),
-    await hashKey(apiKey.key),
+    keyHash,
     JSON.stringify(scopes),
     apiKey.expiresAt
   );
@@ -835,6 +847,100 @@ export async function createApiKey(
 
   backupDbFile("pre-write");
   return apiKey;
+}
+
+export interface CreateApiKeyFromPolicyOptions {
+  /** Absolute expiry used by the legacy create body instead of `policy.expiry`. */
+  absoluteExpiresAt?: string | null;
+  /** Reject blocking stale references (template/policy creation). */
+  enforceReferences?: boolean;
+  /** Audit provenance only; never re-applied over the policy. */
+  templateRef?: { id: string; revision: number };
+}
+
+/**
+ * Creates a key with its complete policy and every related row in one transaction:
+ * on any failure no key row (and no secret) exists. The secret is generated here and
+ * returned once; it is never stored in a template or a policy.
+ */
+export async function createApiKeyFromPolicy(
+  name: string,
+  machineId: string,
+  policy: KeyTemplatePolicy,
+  options: CreateApiKeyFromPolicyOptions = {}
+) {
+  if (!machineId) throw new Error("machineId is required");
+  assertExclusiveLeaseKeyPolicy(policy.key.scopes, policy.key.allowedConnections);
+  const db = getDbInstance() as ApiKeysDbLike;
+  getPreparedStatements(db);
+  if (policy.related.domainBudget) {
+    // Lazily adds the budget columns the domain-state module owns.
+    const { loadBudget } = await import("./domainState");
+    loadBudget("");
+  }
+  if (policy.related.tokenLimits.length > 0) {
+    const { listTokenLimits } = await import("./tokenLimits");
+    listTokenLimits("");
+  }
+  const core = await import("./keyTemplates/policyCore.ts");
+  const { generateApiKeyWithMachine } = await import("@/shared/utils/apiKey");
+  const { key } = generateApiKeyWithMachine(machineId);
+  const id = uuidv4();
+  const now = Date.now();
+  const createdAt = new Date(now).toISOString();
+  const rows = core.templatePolicyToRows(policy, now);
+  if (options.absoluteExpiresAt !== undefined)
+    rows.keyColumns.expires_at = options.absoluteExpiresAt;
+  const identity = {
+    id,
+    name,
+    machineId,
+    secret: encryptApiKeySecret(key),
+    hash: await hashKey(key),
+    prefix: key.slice(0, 12),
+    createdAt,
+  };
+  core.runImmediate(db, () => {
+    if (options.enforceReferences) {
+      const blocking = core.collectReferenceIssues(db, policy).filter((issue) => issue.blocking);
+      if (blocking.length > 0) {
+        throw new KeyTemplateError(
+          422,
+          "REFERENCE_INVALID",
+          "The policy references settings that no longer exist; edit them before creating the key",
+          { issues: blocking }
+        );
+      }
+    }
+    core.insertKeyPolicyRows(db, identity, rows);
+  });
+  clearApiKeyCaches();
+  if (policy.related.reasoningRules.length > 0) invalidateReasoningRoutingRuleCache();
+  invalidateModelCatalogCache();
+  setNoLog(id, policy.key.noLog === true);
+  const { logAuditEvent } = await import("@/lib/compliance");
+  logAuditEvent({
+    action: "apiKey.create",
+    target: id,
+    details: {
+      name,
+      source: options.templateRef ? "template" : "policy",
+      scopes: policy.key.scopes,
+      ...(options.templateRef && {
+        templateId: options.templateRef.id,
+        templateRevision: options.templateRef.revision,
+      }),
+    },
+  });
+  backupDbFile("pre-write");
+  return {
+    id,
+    name,
+    key,
+    machineId,
+    createdAt,
+    expiresAt: (rows.keyColumns.expires_at as string | null) ?? null,
+  };
 }
 
 export async function regenerateApiKey(id: string) {
@@ -963,6 +1069,7 @@ export async function updateApiKeyPermissions(
     usageLimitEnabled?: number;
     dailyUsageLimitUsd?: number | null;
     weeklyUsageLimitUsd?: number | null;
+    fiveHourUsageLimitUsd?: number | null;
     chaosModeEnabled?: number;
     compressionEnabled?: number;
     allowAutoCombos?: number;
@@ -1398,6 +1505,9 @@ export async function validateApiKey(
     return cached.valid;
   }
 
+  const unknownAt = options.bypassCache ? undefined : _unknownKeyCache.get(cacheKey);
+  if (unknownAt !== undefined && now - unknownAt < UNKNOWN_KEY_TTL) return false;
+
   // A Redis hit never authorizes on its own (GHSA-66vh-35g3-78qv): eviction on regenerate/revoke
   // is best-effort and a late SET can resurrect an evicted entry, so the entry could keep a
   // retired credential valid for its whole TTL. SQLite is the source of truth for identity and
@@ -1407,7 +1517,13 @@ export async function validateApiKey(
   const stmt = getPreparedStatements(db);
   const row = lookupByKeyHash(db, stmt.validateKey, hashedKey);
 
-  if (!row) return false;
+  if (!row) {
+    if (!options.bypassCache) {
+      evictIfNeeded(_unknownKeyCache);
+      _unknownKeyCache.set(cacheKey, now);
+    }
+    return false;
+  }
 
   const isBanned = parseIsBanned(row.is_banned ?? row.isBanned);
   if (isBanned) return false;
@@ -1539,6 +1655,7 @@ export async function getApiKeyMetadata(
       usageLimitEnabled: false,
       dailyUsageLimitUsd: null,
       weeklyUsageLimitUsd: null,
+      fiveHourUsageLimitUsd: null,
       chaosModeEnabled: false,
       compressionEnabled: true,
       allowAutoCombos: true,

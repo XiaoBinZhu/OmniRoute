@@ -26,6 +26,11 @@ import { FORMATS } from "../translator/formats.ts";
 type JsonRecord = Record<string, unknown>;
 
 const SAMPLING_PARAMS = ["temperature", "top_p"] as const;
+// Terra additionally rejects log-probability controls when reasoning is active.
+// With effort "none" all four fields remain eligible for passthrough.
+const TERRA_REASONING_SAMPLING_PARAMS = [
+  ...SAMPLING_PARAMS, "top_logprobs", "logprobs",
+] as const;
 // Suffix that encodes an active (non-none) reasoning effort, e.g. `gpt-5.4-high`.
 const ACTIVE_EFFORT_SUFFIX = /-(low|medium|high|xhigh|minimal)$/i;
 // Suffix that encodes the explicit non-reasoning mode, e.g. `gpt-5.4-none`.
@@ -68,7 +73,9 @@ export function stripGpt5SamplingWhenReasoning<T extends Record<string, unknown>
   if (!hasActiveReasoning(record, model)) return body;
 
   const stripped: string[] = [];
-  for (const param of SAMPLING_PARAMS) {
+  const params = model.toLowerCase() === "gpt-6.1-terra"
+    ? TERRA_REASONING_SAMPLING_PARAMS : SAMPLING_PARAMS;
+  for (const param of params) {
     if (Object.hasOwn(record, param)) stripped.push(param);
   }
   if (stripped.length === 0) return body;
@@ -171,5 +178,28 @@ export function stripGpt5ReasoningWhenTools<T extends Record<string, unknown>>(
     `Stripped ${stripped.join(", ")} for ${model} (function tools + reasoning_effort ` +
       `are rejected on /v1/chat/completions; use /v1/responses instead)`
   );
+  return next as T;
+}
+
+/**
+ * `reasoning` is the Responses envelope: raw api.openai.com Chat Completions only
+ * documents `reasoning_effort` and answers 400 "Unknown parameter: 'reasoning'" (#18912).
+ * Keep the effort on the supported field, with the precedence the effort readers use:
+ * `reasoning_effort` first, then `reasoning.effort`. Compatible providers that accept
+ * the object are out of scope, as are Responses targets.
+ */
+export function foldReasoningForOpenAIChat<T extends Record<string, unknown>>(
+  body: T,
+  provider: string | null | undefined,
+  targetFormat: string | null | undefined
+): T {
+  if (provider !== "openai" || targetFormat !== FORMATS.OPENAI) return body;
+  const record = asRecord(body);
+  if (!record || !Object.hasOwn(record, "reasoning")) return body;
+
+  const next: JsonRecord = { ...record };
+  const effort = next.reasoning_effort ?? asRecord(next.reasoning)?.effort;
+  if (typeof effort === "string") next.reasoning_effort = effort;
+  delete next.reasoning;
   return next as T;
 }

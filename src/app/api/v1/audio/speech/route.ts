@@ -27,9 +27,8 @@ import {
   isAllRateLimitedCredentials,
   rateLimitedProviderResponse,
 } from "@/app/api/v1/_shared/rateLimit";
-import { attachOmniRouteMetaToResponse } from "@/domain/omnirouteResponseMeta";
-import { calculateModalCost } from "@/lib/usage/costCalculator";
-import { recordModalCallCost } from "@/domain/costRules";
+import { accountSpeechResponse } from "@/lib/usage/speechRequestAccounting";
+import { runWithCallLogApiKeyContext } from "@/lib/usage/callLogApiKeyContext";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { saveCallLog } from "@/lib/usageDb";
 
@@ -112,10 +111,16 @@ async function postHandler(request, context) {
     const combo = await getComboByName(body.model);
     if (combo) {
       const { executeSpeechCombo } = await import("@omniroute/open-sse/services/speechCombo");
-      const comboResponse = await executeSpeechCombo(body.model, body, startTime, {
-        allowedConnections,
-        isTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
-      });
+      const comboResponse = await executeSpeechCombo(
+        body.model,
+        body,
+        startTime,
+        {
+          allowedConnections,
+          isTargetAllowed: nestCtx ? undefined : createComboTargetKeyGate(policy, body.model),
+        },
+        policy.apiKeyInfo
+      );
       return comboResponse;
     }
   }
@@ -179,32 +184,28 @@ async function postHandler(request, context) {
 
   if (response?.ok) {
     await clearRecoveredProviderState(credentials);
-    // TTS is billed per input character; attach cost telemetry without
-    // touching the audio Content-Type / body (ADD-only headers).
-    const characters = typeof body.input === "string" ? body.input.length : 0;
-    const costUsd = await calculateModalCost("audio", provider, resolvedModel || body.model, {
-      characters,
-    });
-    recordModalCallCost(apiKeyId, { provider, model: resolvedModel || body.model, costUsd });
-    response = attachOmniRouteMetaToResponse(response, {
-      provider,
-      model: resolvedModel || body.model,
-      costUsd,
-      latencyMs: Date.now() - startTime,
-      requestId: generateRequestId(),
-    });
-    saveCallLog({
-      method: "POST",
-      path: "/v1/audio/speech",
-      status: 200,
-      model: logModel,
-      provider,
-      connectionId,
-      duration: Date.now() - startTime,
-      apiKeyId,
-      apiKeyName,
-      correlationId: getNestRequestId(request) ?? generateRequestId(),
-    }).catch(() => {});
+    // T5.1：call_logs 需与 nest 日志共用 correlationId，成本回填才能命中。
+    // accountSpeechResponse 的 MediaRequestIdentity 没有 correlationId 字段，
+    // 通过 call-log 上下文传递（saveCallLog 会回退读取它）。
+    const callLogCorrelationId =
+      getNestRequestId(request) ??
+      resolveIncomingCorrelationId(request.headers.get("x-correlation-id")) ??
+      null;
+    response = await runWithCallLogApiKeyContext(
+      { apiKeyId, apiKeyName, correlationId: callLogCorrelationId },
+      () =>
+        accountSpeechResponse(response, {
+          provider,
+          model: resolvedModel || body.model,
+          connectionId,
+          apiKeyId,
+          apiKeyName,
+          startTime,
+          requestId: generateRequestId(),
+          endpoint: "/v1/audio/speech",
+          characters: typeof body.input === "string" ? [...body.input].length : 0,
+        })
+    );
   } else if (response) {
     const errorText = await response
       .clone()

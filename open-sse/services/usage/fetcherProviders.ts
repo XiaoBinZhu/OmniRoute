@@ -42,6 +42,8 @@ export const USAGE_FETCHER_PROVIDERS = [
   "minimax",
   "minimax-cn",
   "crof",
+  // Mistral vibe/API budgets (GET api.mistral.ai/v1/billing/budget) + plan (console whoami)
+  "mistral",
   // ClinePass 5-hour / weekly / monthly limits (GET /api/v1/users/me/plan/usage-limits)
   "clinepass",
   "bailian-coding-plan",
@@ -114,6 +116,9 @@ export const USAGE_FETCHER_PROVIDERS = [
   // StepFun account balance (GET /v1/accounts; base URL override selects
   // China vs international platform, mirroring the chat path)
   "stepfun",
+  // MegaBrain plan session + weekly limits (GET /api/profile/limits)
+  "megabrain",
+  "mb",
   // Devin CLI agentic quota (Codeium seat-management GetUserStatus, protobuf)
   "devin-cli",
   // ChatPlayground subscription and daily credits (GET /api/user)
@@ -121,6 +126,8 @@ export const USAGE_FETCHER_PROVIDERS = [
   "cpl",
   // Cloudflare Workers AI daily neurons (GraphQL Analytics aiInferenceAdaptiveGroups)
   "cloudflare-ai",
+  // xKiro daily free-token quota only, never the paid wallet (GET /v1/usage)
+  "xkiro",
   // Zed Hosted Models USD credit from an optional Orb billing portal link
   "zed-hosted",
 ] as const;

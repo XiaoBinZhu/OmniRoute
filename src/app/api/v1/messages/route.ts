@@ -162,17 +162,17 @@ async function postHandler(request: any, context: any, preParsedBody: any = null
   const authRejection = await enforceClientApiRouteAuth(request);
   if (authRejection) return authRejection;
 
-  // Reject non-JSON Content-Type with 415 before touching the body — mirrors OpenAI's
+  // Reject non-JSON Content-Type with 415 before touching the body 鈥?mirrors OpenAI's
   // reference API and matches /v1/chat/completions (#6414).
   const ctRejection = requireJsonContentType(request);
   if (ctRejection) return ctRejection;
 
   await ensureInitialized();
   // Streaming Anthropic clients (Claude Code, the Anthropic SDK) drop the connection
-  // when no bytes arrive while a large prompt is processed before the first token — a
+  // when no bytes arrive while a large prompt is processed before the first token 鈥?a
   // big context can exceed the client's stream/first-token watchdog. OmniRoute holds
   // the response until the first useful upstream byte (ensureStreamReadiness), so keep
-  // the connection warm with early keepalives during that gap — same wrapper used by
+  // the connection warm with early keepalives during that gap 鈥?same wrapper used by
   // /v1/responses (#2544). Anthropic clients ignore SSE comments for their watchdog, so
   // emit a real `event: ping` (ANTHROPIC_PING_FRAME). Non-streaming callers keep the
   // verbatim path.
@@ -184,15 +184,13 @@ async function postHandler(request: any, context: any, preParsedBody: any = null
         .json()
         .catch(() => null);
     } catch {
-      // body unavailable / non-JSON — handleChat will return its normal validation error
+      // body unavailable / non-JSON 鈥?handleChat will return its normal validation error
     }
   }
   const accept = String(request.headers?.get?.("accept") || "");
   const wantsStreaming = resolveStreamFlag(body?.stream, accept, "claude");
 
-  // T3.2：Claude 协议与 chat 走同一条边缘计费链路（runNestPreflight → withNestBilling）。
-  // 注意：`requestedModel` 取用户原始名（nest 侧负责别名/日期后缀），maxTokens 按 A1 截断。
-  let nestCtx: NestBillingContext | null = null;
+  // T3.2锛欳laude 鍗忚涓?chat 璧板悓涓€鏉¤竟缂樿璐归摼璺紙runNestPreflight 鈫?withNestBilling锛夈€?  // 娉ㄦ剰锛歚requestedModel` 鍙栫敤鎴峰師濮嬪悕锛坣est 渚ц礋璐ｅ埆鍚?鏃ユ湡鍚庣紑锛夛紝maxTokens 鎸?A1 鎴柇銆?  let nestCtx: NestBillingContext | null = null;
   const callerCorrelationId = resolveIncomingCorrelationId(request.headers.get("x-correlation-id"));
   try {
     const billingModel = typeof body?.model === "string" ? body.model.trim() : "";
@@ -274,7 +272,7 @@ async function postHandler(request: any, context: any, preParsedBody: any = null
   }
 }
 
-// `logger: null` — the guardrail registry re-evaluates this request inside
+// `logger: null` 鈥?the guardrail registry re-evaluates this request inside
 // handleChat with the pino logger (#11936 dedupe).
 // The outer admission wrapper still owns the route-level lease. On a stream deadline,
 // the synthetic SSE body closes, so its response lifecycle releases that lease while

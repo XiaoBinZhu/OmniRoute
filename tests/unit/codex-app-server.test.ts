@@ -431,6 +431,98 @@ test("CodexAppServerExecutor: non-streaming turn returns a JSON Response", async
   assert.ok(Array.isArray(body.output));
 });
 
+/** Run a stream:false turn whose only notification after turn/start is `error`. */
+async function runNonStreamTurnWithError(params: Record<string, unknown>): Promise<Response> {
+  const ctrl = makeFakeSocket();
+  const { fn } = fakeTransport(ctrl);
+  const executor = new CodexAppServerExecutor({ websocketFn: fn });
+  ctrl.socket.send = ((originalSend) => (data: string) => {
+    originalSend(data);
+    const frame = JSON.parse(data) as Record<string, unknown>;
+    if (frame.id == null || !frame.method) return;
+    queueMicrotask(() => {
+      if (frame.method === "thread/start") {
+        ctrl.emit({ jsonrpc: "2.0", id: frame.id, result: { threadId: "thr_1" } });
+      } else if (frame.method === "turn/start") {
+        ctrl.emit({ jsonrpc: "2.0", id: frame.id, result: {} });
+        ctrl.emit({ jsonrpc: "2.0", method: "error", params });
+      } else {
+        ctrl.emit({ jsonrpc: "2.0", id: frame.id, result: {} });
+      }
+    });
+  })(ctrl.socket.send);
+
+  const result = await executor.execute(makeExecuteInput({ stream: false }));
+  return "response" in result ? result.response : (result as Response);
+}
+
+test("execute (non-stream): usageLimitExceeded answers a real 429, not a 200 error body (#19255)", async () => {
+  const response = await runNonStreamTurnWithError({
+    error: {
+      message: "You've hit your usage limit. Try again at 6:42 AM.",
+      codexErrorInfo: "usageLimitExceeded",
+    },
+    willRetry: false,
+  });
+
+  assert.equal(response.status, 429);
+  const body = (await response.json()) as {
+    error: { message: string; type: string; code: string };
+  };
+  assert.equal(body.error.type, "rate_limit_error");
+  // The public body carries the closed 429 identifier, same as the streaming path.
+  assert.equal(body.error.code, "rate_limit_exceeded");
+  assert.match(body.error.message, /hit your usage limit/);
+});
+
+test("execute (non-stream): a generic turn failure keeps the 200 Responses error body", async () => {
+  const response = await runNonStreamTurnWithError({
+    error: { message: "Internal server error occurred" },
+    willRetry: false,
+  });
+
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { status?: string; error?: { code?: string } };
+  assert.equal(body.status, "failed");
+  assert.equal(body.error?.code, "codex_app_server_turn_failed");
+});
+
+test("execute (non-stream): an event backlog overflow ends the turn with an error instead of hanging", async () => {
+  const ctrl = makeFakeSocket();
+  const { fn } = fakeTransport(ctrl);
+  const executor = new CodexAppServerExecutor({ websocketFn: fn });
+  ctrl.socket.send = ((originalSend) => (data: string) => {
+    originalSend(data);
+    const frame = JSON.parse(data) as Record<string, unknown>;
+    if (frame.id == null || !frame.method) return;
+    queueMicrotask(() => {
+      if (frame.method === "thread/start") {
+        ctrl.emit({ jsonrpc: "2.0", id: frame.id, result: { threadId: "thr_1" } });
+      } else if (frame.method === "turn/start") {
+        ctrl.emit({ jsonrpc: "2.0", id: frame.id, result: {} });
+        // More events than the queue holds, in one synchronous burst, alternating kinds so
+        // they cannot coalesce. No terminal notification follows.
+        for (let i = 0; i < 10_050; i += 1) {
+          ctrl.emit({
+            jsonrpc: "2.0",
+            method: i % 2 ? "item/reasoning/textDelta" : "item/agentMessage/delta",
+            params: { delta: "x" },
+          });
+        }
+      } else {
+        ctrl.emit({ jsonrpc: "2.0", id: frame.id, result: {} });
+      }
+    });
+  })(ctrl.socket.send);
+
+  const result = await executor.execute(makeExecuteInput({ stream: false }));
+  const response = "response" in result ? result.response : (result as Response);
+  const body = (await response.json()) as { status?: string; error?: { code?: string } };
+  assert.equal(body.status, "failed");
+  assert.equal(body.error?.code, "codex_app_server_turn_failed");
+  assert.equal(ctrl.closed, true, "the client socket is torn down once the turn fails");
+});
+
 // ── Tool path: INBOUND advertise + OUTBOUND passthrough ──────────────────────
 
 test("dynamicToolWireName: flattens namespaced tools, passes plain ones through", () => {

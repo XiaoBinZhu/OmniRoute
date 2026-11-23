@@ -331,11 +331,34 @@ export class CodexAppServerExecutor extends BaseExecutor {
         events.close();
         markTerminated();
       };
+      const failTurn = (err: unknown) => {
+        if (terminated) return;
+        const message = sanitizeErrorMessage(err instanceof Error ? err.message : err);
+        const status = drainAwareFailureStatus(502);
+        events.push({
+          type: "error",
+          message,
+          status,
+          errorType: status === 499 ? "client_disconnected" : "provider_error",
+          code: status === 499 ? "client_disconnected" : "codex_app_server_turn_failed",
+        });
+        events.close();
+        markTerminated();
+      };
+      // Socket callbacks run outside this function's catch: a push that overflows the event
+      // backlog must still end the turn with an error the consumer sees.
+      const pushEvent = (event: AdapterEvent) => {
+        try {
+          events.push(event);
+        } catch (err) {
+          failTurn(err);
+        }
+      };
       try {
         // Setup responses and socket closure can arrive in the same frame batch.
         client.onNotification((method, params) => {
           if (terminated) return;
-          const isTerminal = translateNotification(method, params, (event) => events.push(event));
+          const isTerminal = translateNotification(method, params, pushEvent);
           if (isTerminal) {
             events.close();
             markTerminated();
@@ -394,7 +417,7 @@ export class CodexAppServerExecutor extends BaseExecutor {
           const toolParams = (
             params && typeof params === "object" ? params : {}
           ) as DynamicToolCallLike;
-          translateToolCall(toolParams, (event) => events.push(event));
+          translateToolCall(toolParams, pushEvent);
           // Settle the app-server request so the socket does not stall. The router
           // does not have the tool output (the harness will produce it next turn),
           // so we report the passthrough as an unsuccessful in-line result and end
@@ -447,19 +470,7 @@ export class CodexAppServerExecutor extends BaseExecutor {
         // down the socket mid-turn and the queue never closes (request hangs).
         await turnDone;
       } catch (err) {
-        if (!terminated) {
-          const message = sanitizeErrorMessage(err instanceof Error ? err.message : err);
-          const status = drainAwareFailureStatus(502);
-          events.push({
-            type: "error",
-            message,
-            status,
-            errorType: status === 499 ? "client_disconnected" : "provider_error",
-            code: status === 499 ? "client_disconnected" : "codex_app_server_turn_failed",
-          });
-          events.close();
-          markTerminated();
-        }
+        failTurn(err);
       } finally {
         client.close();
       }
@@ -469,20 +480,8 @@ export class CodexAppServerExecutor extends BaseExecutor {
       const running = run();
       const collected = await events.collect();
       await running;
-      const drainFailure = collected.find(
-        (event) => event.type === "error" && event.status === 499
-      );
-      if (drainFailure?.type === "error") {
-        // Our own shutdown tore the app-server down under a request that was still
-        // in flight: the turn was never really served by the provider. Answer 499
-        // (client_disconnected) with the canonical body of the repo's errorResponse
-        // helper, so the runtime does not read our own teardown as provider ill
-        // health (see open-sse/utils/drainStatus.ts).
-        return {
-          response: canonicalErrorResponse(499, drainFailure.message),
-          url: config.url,
-        };
-      }
+      const failureResponse = nonStreamFailureResponse(collected);
+      if (failureResponse) return { response: failureResponse, url: config.url };
       const response = buildResponseJSON(collected, input.model, {
         toolNsMap: toolMaps.namespace,
         freeformToolNames: toolMaps.freeform,
@@ -509,6 +508,27 @@ export class CodexAppServerExecutor extends BaseExecutor {
       url: config.url,
     };
   }
+}
+
+/**
+ * The failures a non-streaming turn must answer with their own HTTP status, instead
+ * of the 200 Responses body that `buildResponseJSON` would wrap them in.
+ */
+function nonStreamFailureResponse(collected: AdapterEvent[]): Response | null {
+  for (const event of collected) {
+    if (event.type !== "error") continue;
+    // Our own shutdown tore the app-server down under a request that was still
+    // in flight: the turn was never really served by the provider. Answer 499
+    // (client_disconnected) with the canonical body of the repo's errorResponse
+    // helper, so the runtime does not read our own teardown as provider ill
+    // health (see open-sse/utils/drainStatus.ts).
+    if (event.status === 499) return canonicalErrorResponse(499, event.message);
+    // An exhausted account (usageLimitExceeded) has to reach the runtime as a 429:
+    // inside a 200 body the combo reads it as a quality failure, skips the quota
+    // cooldown and retries every sibling variant of the model (#19255).
+    if (event.status === 429) return canonicalErrorResponse(429, event.message);
+  }
+  return null;
 }
 
 function errorResponse(status: number, message: string, code: string): Response {
