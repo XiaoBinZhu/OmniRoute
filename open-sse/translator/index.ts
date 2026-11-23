@@ -7,6 +7,7 @@ import {
 } from "./helpers/toolCallHelper.ts";
 import {
   NON_ANTHROPIC_THINKING_PLACEHOLDER,
+  enforceCacheControlBlockLimit,
   prepareClaudeRequest,
 } from "./helpers/claudeHelper.ts";
 import { filterToOpenAIFormat } from "./helpers/openaiHelper.ts";
@@ -40,9 +41,11 @@ import { normalizeRoles, resolvePreserveDeveloperRole } from "../services/roleNo
 import { hoistLeadingSystemMessage } from "./helpers/strictSystemHoist.ts";
 import { ensurePoeUserTurnHasText } from "./helpers/poeImageOnlyUserTurn.ts";
 import { acceptsInlineToolAdditions, hoistToolAdditions } from "./helpers/claudeDeferredTools.ts";
+import { ownMessages } from "./helpers/callerMessages.ts";
 import { isStrictResponsesToolHistoryEnabled } from "./helpers/responsesToolHistory.ts";
 import {
   buildAssistantMessageCacheKey,
+  buildToolCallCacheKey,
   lookupReasoning,
   recordReplay,
   requiresReasoningReplay,
@@ -54,6 +57,7 @@ import {
 } from "./request/openai-responses/helpers.ts";
 import { applyReasoningInputPolicy } from "../services/reasoningInputPolicy.ts";
 import { normalizeReasoningRequest } from "@/shared/reasoning/effortStandardization";
+import { hoistSystemDirectiveEffort } from "./request/claude-to-openai.ts";
 
 bootstrapTranslatorRegistry();
 export { register } from "./registry.ts";
@@ -287,7 +291,7 @@ function replayOpenAIReasoningMessage(
       : null;
   const cacheKey = hasToolCalls
     ? typeof firstToolCall?.id === "string"
-      ? firstToolCall.id
+      ? buildToolCallCacheKey(options.reasoningCacheScope, firstToolCall.id)
       : ""
     : buildAssistantMessageCacheKey(options.reasoningCacheScope, messages, messageIndex);
   if (cacheKey && !options.videoTranscriptSensitive) {
@@ -345,6 +349,12 @@ const OPENAI_INCOMPATIBLE_ECHO_FIELDS = [
   "cache_control",
 ];
 
+/** A top-level `thread` object marks a Claude message-threads delta body. */
+function carriesMessageThread(body: unknown): boolean {
+  const thread = (body as { thread?: unknown } | null)?.thread;
+  return thread !== null && typeof thread === "object" && !Array.isArray(thread);
+}
+
 /**
  * Translate a request between protocols, applying target-specific compatibility rules and
  * enforcing attachment preservation for CI dispatch.
@@ -376,8 +386,24 @@ export function translateRequest(
     /** UA-detected GitHub Copilot client. Forwarded to translators via the
      *  transient `_copilotClient` credential flag (see openai-responses → openai). */
     copilotClient?: boolean;
+    /** Per-conversation key for the Antigravity upstream sessionId (prompt-cache scope). */
+    antigravitySessionKey?: string | null;
   }
 ) {
+  // Only Anthropic holds message-thread state. A `thread` delta (the message-threads beta) omits
+  // the earlier turns, so a translated route would answer with no history. Refuse it with the
+  // code that makes Claude Code resend the full conversation. Same gate as the tool additions.
+  if (
+    sourceFormat === FORMATS.CLAUDE &&
+    !(targetFormat === FORMATS.CLAUDE && acceptsInlineToolAdditions(provider)) &&
+    carriesMessageThread(body)
+  ) {
+    throw Object.assign(new Error("message threads are not supported on translated routes"), {
+      statusCode: 400,
+      errorType: "invalid_request_error",
+      details: { error_code: "thread_unsupported_request" },
+    });
+  }
   // Claude Code inline-tools `tool_addition` blocks only reach Anthropic-native targets;
   const originalCIMedia =
     provider === "cheaperinference" || provider === "cinf" ? requestMediaRefs(body) : null;
@@ -385,9 +411,8 @@ export function translateRequest(
   const hoistDeferredTools =
     sourceFormat === FORMATS.CLAUDE &&
     !(targetFormat === FORMATS.CLAUDE && acceptsInlineToolAdditions(provider));
-  let result = normalizeReasoningRequest(
-    hoistDeferredTools ? hoistToolAdditions(body) : body,
-    provider
+  let result = ownMessages(
+    normalizeReasoningRequest(hoistDeferredTools ? hoistToolAdditions(body) : body, provider)
   );
   const use9CharId = options?.normalizeToolCallId === true;
   const preserveDeveloperRole = options?.preserveDeveloperRole;
@@ -408,8 +433,27 @@ export function translateRequest(
     ["opencode-go", "opencode-zen"].includes(normalizedProvider) ||
     /glm|zhipu|z-ai/i.test(normalizedModel);
 
-  // Phase 2: Apply thinking budget control before normalization
-  result = applyThinkingBudget(result);
+  // Claude → OpenAI shaped targets take the turn's effort from the last system directive.
+  // The steps below read only the top-level effort, so move it there first. A `default` rule
+  // was matched without seeing the directive and would overwrite it: the directive stays in
+  // the messages and the translator reads it from there.
+  if (
+    sourceFormat === FORMATS.CLAUDE &&
+    targetFormat !== FORMATS.CLAUDE &&
+    (targetFormat === FORMATS.OPENAI || !getRequestTranslator(sourceFormat, targetFormat)) &&
+    (result as { _omnirouteReasoningRule?: { effortMode?: string } })._omnirouteReasoningRule
+      ?.effortMode !== "default"
+  ) {
+    result = hoistSystemDirectiveEffort(result);
+  }
+
+  // Phase 2: Apply thinking budget control before normalization. Gemini targets receive
+  // the model so a native thinkingLevel reaches the translator instead of a lossy budget.
+  // Claude -> Antigravity is excluded: claude-to-openai drops the level on the hub path.
+  const readsNativeGeminiLevel =
+    targetFormat === FORMATS.GEMINI ||
+    (targetFormat === FORMATS.ANTIGRAVITY && sourceFormat !== FORMATS.CLAUDE);
+  result = applyThinkingBudget(result, null, readsNativeGeminiLevel ? normalizedModel : undefined);
   // Explicit reasoning-routing policies are final. The marker is internal and is
   // consumed here before any provider translation can see it.
   result = applyReasoningRuleDirective(result);
@@ -529,10 +573,12 @@ export function translateRequest(
       // thoughtSignature on tool-use history (#8979 / #2504 parity with the hub path).
       const hasNs = options?.signatureNamespace != null;
       const hasProvider = provider != null;
+      const agySessionKey = options?.antigravitySessionKey || null;
       const directCredentials =
-        hasNs || hasProvider
+        hasNs || hasProvider || agySessionKey
           ? {
               ...(credentials && typeof credentials === "object" ? credentials : {}),
+              ...(agySessionKey ? { _antigravitySessionKey: agySessionKey } : {}),
               ...(hasProvider ? { _provider: provider } : {}),
               ...(hasNs
                 ? {
@@ -561,7 +607,7 @@ export function translateRequest(
           // stripped.
           const preserveCacheControl =
             options?.preserveCacheControl === true &&
-            providerHonorsOpenAIFormatCacheControl(provider, connectionCacheOverride);
+            providerHonorsOpenAIFormatCacheControl(provider, connectionCacheOverride, model);
           // Routed provider id lets claudeToOpenAIRequest keep service_tier only for
           // targets that accept it.
           const hasStep1Provider = provider != null;
@@ -643,10 +689,17 @@ export function translateRequest(
           const hasCopilot = options?.copilotClient === true;
           const hasProvider = provider != null;
           const videoSensitive = options?.videoTranscriptSensitive === true;
+          const agySessionKey = options?.antigravitySessionKey || null;
           const translationCredentials =
-            hasNs || hasPreCompression || hasCopilot || hasProvider || videoSensitive
+            hasNs ||
+            hasPreCompression ||
+            hasCopilot ||
+            hasProvider ||
+            videoSensitive ||
+            agySessionKey
               ? {
                   ...(credentials && typeof credentials === "object" ? credentials : {}),
+                  ...(agySessionKey ? { _antigravitySessionKey: agySessionKey } : {}),
                   ...(hasNs
                     ? {
                         _signatureNamespace: scopeGeminiThoughtSignatureNamespace(
@@ -700,11 +753,12 @@ export function translateRequest(
     // #2069 — preserve client cache_control breakpoints only for providers that
     // honor explicit OpenAI-format markers (DashScope/alibaba, Xiaomi MiMo) when
     // requested upstream; generic/implicit-cache OpenAI providers stay stripped.
+    const preserveOpenAICacheControl =
+      options?.preserveCacheControl === true &&
+      providerHonorsOpenAIFormatCacheControl(provider, connectionCacheOverride, model);
     result = filterToOpenAIFormat(result, {
       normalizeFileUrls: normalizedProvider === "cheaperinference" || normalizedProvider === "cinf",
-      preserveCacheControl:
-        options?.preserveCacheControl === true &&
-        providerHonorsOpenAIFormatCacheControl(provider, connectionCacheOverride),
+      preserveCacheControl: preserveOpenAICacheControl,
       preservePromptCacheBreakpoint: providerAcceptsPromptCacheBreakpoint(provider),
       // #4849 regression guard: keep client reasoning_content for replay providers.
       preserveReasoningContent: isReasoner,
@@ -719,6 +773,11 @@ export function translateRequest(
       // Same decision normalizeRoles made above — never undo it here.
       preserveDeveloperRole: resolvePreserveDeveloperRole(preserveDeveloperRole, provider),
     });
+    // OpenRouter relays explicit breakpoints to Anthropic, which allows 4 at most. The Claude
+    // path enforces this in prepareClaudeRequest; this OpenAI-format path had no cap.
+    if (preserveOpenAICacheControl && normalizedProvider === "openrouter") {
+      enforceCacheControlBlockLimit(result);
+    }
   }
 
   // Final step: prepare request for Claude format endpoints
@@ -734,6 +793,7 @@ export function translateRequest(
     const preserveCache = isClaudePassthrough || options?.preserveCacheControl === true;
     result = prepareClaudeRequest(result, provider, preserveCache, model, {
       fallbackToHeuristicWhenNoMarkers: true,
+      reasoningCacheScope: options?.reasoningCacheScope,
     });
   }
 
@@ -875,7 +935,9 @@ export function translateRequest(
         // Client reasoning wins above. Otherwise try authentic replay before
         // retaining Kimi Code's empty protocol marker as the final fallback.
         if (firstToolUseId && !options?.videoTranscriptSensitive) {
-          const cached = lookupReasoning(firstToolUseId);
+          const cached = lookupReasoning(
+            buildToolCallCacheKey(options?.reasoningCacheScope, firstToolUseId)
+          );
           if (cached) {
             if (thinkingBlock) {
               thinkingBlock.type = "thinking";

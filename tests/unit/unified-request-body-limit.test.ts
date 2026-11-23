@@ -20,6 +20,8 @@ const { checkBodySize, getBodySizeLimit } =
   await import("../../src/shared/middleware/bodySizeGuard.ts");
 const { admitChatRequest, ChatAdmissionController, resolveSelfLoopBearer } =
   await import("../../src/shared/middleware/chatBodyAdmission.ts");
+const { SELF_HOP_HEADER, ownListenerSelfHopToken } =
+  await import("../../open-sse/utils/selfHop.ts");
 
 const paths = [
   "/api/v1/chat/completions",
@@ -42,6 +44,7 @@ function request(pathname: string, bytes: number, declared?: number, internal = 
   if (internal) {
     headers.set("x-omniroute-admission-bypass", "internal");
     headers.set("authorization", `Bearer ${resolveSelfLoopBearer()}`);
+    headers.set(SELF_HOP_HEADER, ownListenerSelfHopToken());
   }
   const body = new ReadableStream<Uint8Array>(
     {
@@ -91,7 +94,7 @@ test("without a saved limit the LLM routes keep 50 MiB, whatever the env default
   assert.equal(settings.savedMaxBodySizeMb, null, "the seeded default does not count as saved");
   assert.equal(getBodySizeLimit("/api/v1/responses", settings), 50 * MIB);
   assert.equal(getBodySizeLimit("/api/v1/chat/completions", settings), 50 * MIB);
-  assert.equal(getBodySizeLimit("/api/v1/messages", settings), 3 * MIB);
+  assert.equal(getBodySizeLimit("/api/v1/messages", settings), 50 * MIB);
 
   const aboveEnvDefault = 3 * MIB + 1;
   const accepted = await admit(

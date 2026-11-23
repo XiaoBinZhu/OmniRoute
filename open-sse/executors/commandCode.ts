@@ -19,10 +19,33 @@ import {
 import { applyReasoningEffortRecovery } from "./base/reasoningEffortRecovery.ts";
 import { applyFieldDowngradeRecovery } from "./base/fieldDowngradeRecovery.ts";
 import { peekCommandCodeCliStream } from "./commandCode/cliEmbeddedError.ts";
+import { commandCodeSessionId } from "./commandCode/sessionId.ts";
 
 type JsonRecord = Record<string, unknown>;
 
-export const COMMAND_CODE_VERSION = process.env.COMMAND_CODE_VERSION?.trim() || "1.15.1";
+export const COMMAND_CODE_VERSION = process.env.COMMAND_CODE_VERSION?.trim() || "1.88.0";
+
+/**
+ * CLI-mimic headers for the /alpha/generate fallback and the API-key probe,
+ * aligned with the official CLI 1.88.0 wire format (`x-cli-environment:
+ * production`, `x-cli-surface: cli`). The chat path sends none of these.
+ */
+export function buildCommandCodeCliHeaders(
+  apiKey: string,
+  sessionId: string
+): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+    "x-command-code-version": COMMAND_CODE_VERSION,
+    "x-cli-environment": "production",
+    "x-cli-surface": "cli",
+    "x-project-slug": "pi-cc",
+    "x-taste-learning": "false",
+    "x-co-flag": "false",
+    "x-session-id": sessionId,
+  };
+}
 
 // Defensive server-side ceiling for a CLIENT-SUPPLIED max_tokens:
 // any request with params.max_tokens > 200_000 is rejected with a 400
@@ -969,6 +992,29 @@ async function createJsonResponse(
 
 // ── CommandCodeExecutor ──────────────────────────────────────────────────────
 
+/**
+ * Wraps a non-OK upstream reply as the executor result, keeping its status, status
+ * text and headers; an unreadable body falls back to a generic message.
+ */
+async function upstreamErrorResult<T>(
+  upstream: Response,
+  label: string,
+  request: { url: string; headers: Record<string, string>; transformedBody: T }
+) {
+  const errorText = await upstream.text().catch(() => {
+    console.warn(`[commandCode] ${label} text failed`);
+    return "";
+  });
+  return {
+    response: new Response(errorText || `Command Code API error ${upstream.status}`, {
+      status: upstream.status,
+      statusText: upstream.statusText,
+      headers: upstream.headers,
+    }),
+    ...request,
+  };
+}
+
 export class CommandCodeExecutor extends BaseExecutor {
   constructor(provider = "command-code") {
     super(provider, REGISTRY["command-code"]);
@@ -1011,32 +1057,33 @@ export class CommandCodeExecutor extends BaseExecutor {
     sanitizedBody: unknown;
     stream: boolean;
     apiKey: string;
+    connectionId?: string;
+    clientHeaders?: Record<string, string> | null;
     signal?: AbortSignal;
     upstreamExtraHeaders?: Record<string, string>;
     providerSpecificData?: unknown;
   }) {
     const { model, sanitizedBody, stream, apiKey, signal, upstreamExtraHeaders } = input;
     const cliUrl = this.buildCliUrl();
-    const cliHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "x-command-code-version": COMMAND_CODE_VERSION,
-      "x-cli-environment": "external",
-      "x-project-slug": "pi-cc",
-      "x-taste-learning": "false",
-      "x-co-flag": "false",
-      "x-session-id": randomUUID(),
-    };
-    mergeUpstreamExtraHeaders(cliHeaders, upstreamExtraHeaders);
-    applyCommandCodeZdrHeader(cliHeaders, input.providerSpecificData);
-
-    const abortSignal = signal || undefined;
-    const { body: initialCliTransformedBody, toolNameMap } = buildCommandCodeCliBody(
+    const { body: builtCliBody, toolNameMap } = buildCommandCodeCliBody(
       model,
       sanitizedBody,
       stream
     );
-    let cliTransformedBody = initialCliTransformedBody;
+    // Upstream keys its prompt cache on this id: one per conversation (and tenant), never
+    // per request, carried identically in the header and the envelope `threadId`.
+    const sessionId = commandCodeSessionId({
+      body: sanitizedBody,
+      params: builtCliBody.params as JsonRecord,
+      clientHeaders: input.clientHeaders,
+      tenantKey: input.connectionId || apiKey,
+    });
+    const cliHeaders = buildCommandCodeCliHeaders(apiKey, sessionId);
+    mergeUpstreamExtraHeaders(cliHeaders, upstreamExtraHeaders);
+    applyCommandCodeZdrHeader(cliHeaders, input.providerSpecificData);
+
+    const abortSignal = signal || undefined;
+    let cliTransformedBody: JsonRecord = { threadId: sessionId, ...builtCliBody };
 
     let cliUpstream = await fetch(cliUrl, {
       method: "POST",
@@ -1060,20 +1107,11 @@ export class CommandCodeExecutor extends BaseExecutor {
     cliTransformedBody = { ...cliTransformedBody, params: cliRecovery.body };
 
     if (!cliUpstream.ok) {
-      const errorText = await cliUpstream.text().catch(() => {
-        console.warn("[commandCode] cli upstream text failed");
-        return "";
-      });
-      return {
-        response: new Response(errorText || `Command Code API error ${cliUpstream.status}`, {
-          status: cliUpstream.status,
-          statusText: cliUpstream.statusText,
-          headers: cliUpstream.headers,
-        }),
+      return upstreamErrorResult(cliUpstream, "cli upstream", {
         url: cliUrl,
         headers: cliHeaders,
         transformedBody: cliTransformedBody,
-      };
+      });
     }
 
     // An embedded `error` frame before any content fails the request with its own status.
@@ -1108,7 +1146,15 @@ export class CommandCodeExecutor extends BaseExecutor {
     return headers;
   }
 
-  async execute({ model, body, stream, credentials, signal, upstreamExtraHeaders }: ExecuteInput) {
+  async execute({
+    model,
+    body,
+    stream,
+    credentials,
+    signal,
+    upstreamExtraHeaders,
+    clientHeaders,
+  }: ExecuteInput) {
     const apiKey = credentials?.apiKey || credentials?.accessToken;
     if (!apiKey) throw new Error("Command Code API key required");
 
@@ -1185,6 +1231,8 @@ export class CommandCodeExecutor extends BaseExecutor {
           sanitizedBody: cliShaped,
           stream,
           apiKey,
+          connectionId: credentials?.connectionId,
+          clientHeaders,
           signal,
           upstreamExtraHeaders,
           providerSpecificData,
@@ -1192,19 +1240,6 @@ export class CommandCodeExecutor extends BaseExecutor {
       }
     }
 
-    const errorText = await upstream.text().catch(() => {
-      console.warn("[commandCode] upstream text failed");
-      return "";
-    });
-    return {
-      response: new Response(errorText || `Command Code API error ${upstream.status}`, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: upstream.headers,
-      }),
-      url,
-      headers,
-      transformedBody,
-    };
+    return upstreamErrorResult(upstream, "upstream", { url, headers, transformedBody });
   }
 }

@@ -1,4 +1,6 @@
+import { transformStreamWithCancel } from "../../open-sse/utils/cancelableTransformStream.ts";
 import { resolveStreamIndices } from "./streamIndices";
+import { createResponsesSseText } from "./responsesSseText";
 export type FieldCategory = "content" | "reasoning" | "toolArgs" | "partialJson";
 
 // Keys that always map to a fixed category, regardless of where they appear in the chunk.
@@ -59,6 +61,10 @@ export const METADATA_KEYS = new Set([
   "speed",
   "signature",
   "request_id",
+  // Mistral anti token-length side-channel padding (#19293): random alphabet/digit runs
+  // attached to every streamed chunk since 2025-08-27 (Mistral changelog). Not answer
+  // text; routing it to content spliced padding into the next real text delta.
+  "p",
 ]);
 
 // Anthropic Messages SSE frames. Their streamed text lives at fixed paths (block text,
@@ -161,6 +167,34 @@ export function classifyField(key: string, parentKey = ""): FieldCategory | null
   return "content";
 }
 
+/** The complete encrypted reasoning record is protocol state, including unknown extensions. */
+export function isOpaqueReasoningDetail(value: unknown, parentKey: string): boolean {
+  return (
+    parentKey === "reasoning_details" &&
+    value !== null &&
+    typeof value === "object" &&
+    (value as Record<string, unknown>).type === "reasoning.encrypted"
+  );
+}
+
+/**
+ * A synthetic text-tail flush must not replay opaque records already forwarded in the
+ * original frames. Call only on the cloned flush template, never on an incoming frame.
+ */
+export function omitEmittedOpaqueReasoningFromFlush(value: unknown): void {
+  if (!value || typeof value !== "object") return;
+  const record = value as Record<string, unknown>;
+  for (const [key, child] of Object.entries(record)) {
+    if (key === "reasoning_details" && Array.isArray(child)) {
+      const remaining = child.filter((detail) => !isOpaqueReasoningDetail(detail, key));
+      if (remaining.length) record[key] = remaining;
+      else delete record[key];
+    } else {
+      omitEmittedOpaqueReasoningFromFlush(child);
+    }
+  }
+}
+
 // Back-compat helper kept for any external caller expecting a category rather than `null`
 // for metadata; internal call sites use `classifyField` so they can skip metadata entirely.
 export function getFieldCategory(key: string): FieldCategory {
@@ -202,6 +236,11 @@ export function checkIfSnapshot(json: any): boolean {
 
 const fallbackDecoder = new TextDecoder();
 
+/**
+ * Parse fragmented SSE and process provider payload fields without changing event framing.
+ * Snapshots are processed independently; buffered tails drain before stop events or EOF.
+ * Responses lanes use schema-aware routing and may release processor state after draining.
+ */
 export function createSseTextTransform(
   processor: (
     text: string,
@@ -213,7 +252,7 @@ export function createSseTextTransform(
   ) => string,
   onFlush?: (lastJson: any, isJsonStream?: boolean, lastContentJson?: any) => any,
   onCancel?: () => void,
-  opts?: { processToolArgs?: boolean }
+  opts?: { processToolArgs?: boolean; releaseResponsesLane?: (index: string) => void }
 ): TransformStream {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder("utf-8");
@@ -227,6 +266,22 @@ export function createSseTextTransform(
   let currentEventLine = "";
   let lastEventLine = "";
   let pendingEventLine = "";
+  const responses = createResponsesSseText(processor, {
+    processToolArgs: opts?.processToolArgs,
+    release: opts?.releaseResponsesLane,
+    classify: classifyField,
+  });
+  let responsesStream = false;
+  const emitResponses = (
+    events: Record<string, unknown>[],
+    controller: TransformStreamDefaultController
+  ) => {
+    for (const event of events) {
+      controller.enqueue(
+        encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      );
+    }
+  };
   let sawEventLine = false;
 
   // Claude flushes are synthetic content_block_delta frames: clients that dispatch on the
@@ -273,7 +328,8 @@ export function createSseTextTransform(
       lastPrefix = prefix;
       const segment = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
       if (segment === "[DONE]") {
-        if (onFlush && !flushed) {
+        if (responsesStream) emitResponses(responses.drain(), controller);
+        if (!responsesStream && onFlush && !flushed) {
           emitFlushed(
             onFlush(lastJson, isJsonStream, lastContentJson),
             controller,
@@ -314,11 +370,13 @@ export function createSseTextTransform(
             parentKey = ""
           ) => {
             if (!obj || typeof obj !== "object") return;
+            if (isOpaqueReasoningDetail(obj, parentKey)) return;
 
             const { choiceIdx, toolIdx } = resolveStreamIndices(
               obj,
               currentChoiceIdx,
-              currentToolIdx
+              currentToolIdx,
+              parentKey
             );
 
             const compositeKey = `${choiceIdx}_${toolIdx}`;
@@ -327,8 +385,15 @@ export function createSseTextTransform(
             for (const key of Object.keys(obj)) {
               if (typeof obj[key] === "string") {
                 const val = obj[key];
-                // Preserve Chat Completions aliases without changing native-format routing.
-                const fieldName = Array.isArray(json.choices) ? key : undefined;
+                // Keep wire aliases distinct in Chat and generic text envelopes. Native
+                // Responses/Gemini retain their format-specific buffer/flush routing.
+                const fieldName =
+                  Array.isArray(json.choices) ||
+                  (key === "reasoning_content" &&
+                    !Array.isArray(json.candidates) &&
+                    !String(json.type ?? "").startsWith("response."))
+                    ? key
+                    : undefined;
                 const field =
                   key === "delta" && obj === json && isResponsesToolArgsDelta(json)
                     ? "toolArgs"
@@ -389,7 +454,12 @@ export function createSseTextTransform(
           };
 
           const claudeEvent = isClaudeStreamEvent(json);
-          if (claudeEvent) {
+          const isResponses = typeof json.type === "string" && json.type.startsWith("response.");
+          if (isResponses) {
+            responsesStream = true;
+            emitResponses(responses.transform(json), controller);
+            matched = true;
+          } else if (claudeEvent) {
             matched = sanitizeClaudeEvent();
           } else {
             sanitizeObject(json, 0, 0);
@@ -409,7 +479,7 @@ export function createSseTextTransform(
             flushed = false;
           }
 
-          if (isStopSignal && onFlush && !flushed) {
+          if (!isResponses && isStopSignal && onFlush && !flushed) {
             // A Claude stop signal passes its own frame: the flush helper drains every block
             // that still holds a tail, and the last frame may be a `ping`, which would send
             // the flush down the generic path. Other stop signals keep the last frame as the
@@ -490,7 +560,7 @@ export function createSseTextTransform(
     }
   };
 
-  return new TransformStream({
+  return transformStreamWithCancel<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       try {
         const chunkStr = decoder.decode(chunk, { stream: true });
@@ -502,15 +572,13 @@ export function createSseTextTransform(
           handleLine(line, controller);
         }
       } catch (err: any) {
-        let context = "[REDACTED_DUE_TO_PII]";
-        if (!err?.message?.startsWith("[PII]")) {
-          if (typeof chunk === "string") {
-            context = chunk.slice(0, 200);
-          } else if (chunk instanceof Uint8Array) {
-            context = fallbackDecoder.decode(chunk.slice(0, 200));
-          } else {
-            context = String(chunk).slice(0, 200);
-          }
+        // chunk is typed Uint8Array, so the [unavailable] fallback only fires if a
+        // caller violates that contract at runtime. Keep the guard so a bad caller
+        // logs a label instead of throwing inside the error path.
+        const errorIsPii = !!err?.message?.startsWith("[PII]");
+        let context = errorIsPii ? "[REDACTED_DUE_TO_PII]" : "[unavailable]";
+        if (!errorIsPii && chunk instanceof Uint8Array) {
+          context = fallbackDecoder.decode(chunk.slice(0, 200));
         }
         console.error("[SSE-TRANSFORM] Error in transform:", err, "chunk:", context);
         lineBuffer = "";
@@ -529,7 +597,8 @@ export function createSseTextTransform(
           controller.enqueue(encoder.encode(pendingEventLine + "\n"));
           pendingEventLine = "";
         }
-        if (onFlush && !flushed) {
+        if (responsesStream) emitResponses(responses.drain(), controller);
+        if (!responsesStream && onFlush && !flushed) {
           emitFlushed(
             onFlush(lastJson, isJsonStream, lastContentJson),
             controller,
@@ -547,5 +616,5 @@ export function createSseTextTransform(
         onCancel();
       }
     },
-  } as any);
+  });
 }

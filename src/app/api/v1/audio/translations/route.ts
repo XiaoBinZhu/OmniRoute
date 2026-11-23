@@ -287,6 +287,7 @@ async function postHandler(request) {
         } catch {}
 
         const comboResponse = await handleComboChat({
+          endpointCapability: "audio-translations",
           body: { model: modelStr } as any,
           combo: combo as any,
           handleSingleModel: async (_reqBody: any, targetModelStr: string) =>

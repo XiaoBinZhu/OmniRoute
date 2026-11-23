@@ -476,6 +476,7 @@ export async function executeChatWithBreaker({
   // non-video request. Passed straight through to handleChatCore; see its own destructure default.
   videoBridgeLog = undefined,
   fallbackAttempts = undefined,
+  requestUpstreamStartTimeoutMs = undefined,
   forcedConnectionId = null,
   allowedConnections = null,
   // optional resume flag from a rehydrated previous_response_id —
@@ -555,6 +556,7 @@ export async function executeChatWithBreaker({
             videoBridgeLog,
             previousResponseResumed,
             fallbackAttempts,
+            requestUpstreamStartTimeoutMs,
             forcedConnectionId,
             allowedConnections,
             skipResourcePressureGuard: true,
@@ -574,21 +576,26 @@ export async function executeChatWithBreaker({
             },
             onRequestSuccess: async () => {
               if (isShadowTraffic) return;
+              // An in-pipeline account rotation rewrites refreshedCredentials; the account
+              // that served is the one whose error state a success clears.
+              const served = refreshedCredentials?.connectionId
+                ? refreshedCredentials
+                : credentials;
               // Only a real success ends the per-request refusal streak (#12859), and only for
               // the model that succeeded: a sibling model's success must not reset another
               // model's refusal count (the streak is keyed by connection + model).
-              if (credentials.connectionId) {
-                clearRequestRejectedStreak(credentials.connectionId, model);
+              if (served.connectionId) {
+                clearRequestRejectedStreak(served.connectionId, model);
               }
-              await clearAccountError(credentials.connectionId, credentials);
+              await clearAccountError(served.connectionId, served);
               await clearAntigravityVerificationUrl(
                 provider,
-                credentials.connectionId,
-                credentials.providerSpecificData
+                served.connectionId,
+                served.providerSpecificData
               );
               await maybeReactivateAfterExplicitProbe({
-                connectionId: credentials.connectionId,
-                reactivatedFromInactive: credentials.reactivatedFromInactive,
+                connectionId: served.connectionId,
+                reactivatedFromInactive: served.reactivatedFromInactive,
                 isShadowTraffic,
                 requestedModel: model,
                 provider,
@@ -601,6 +608,10 @@ export async function executeChatWithBreaker({
                 Number(failure?.status) === 499 ||
                 failure?.code === "client_disconnected" ||
                 failure?.type === "client_disconnected" ||
+                // A 200 stream cut without an upstream status is a transport event, not an
+                // account refusal: a real refusal carries its own status/code and keeps cooling.
+                (failure?.code === "stream_terminated" &&
+                  Number(failure?.status) === HTTP_STATUS.BAD_GATEWAY) ||
                 isRequestScopedUpstreamFailure(failure) ||
                 isLocalStreamLifecycleError(failure?.message ?? failure) // client abort, #4602
               ) {

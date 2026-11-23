@@ -908,6 +908,86 @@ test("injects prompt_cache_key for Kimi Code's OpenAI protocol", async () => {
   assert.match(String(out.prompt_cache_key), /^omni-[0-9a-f]{32}$/);
 });
 
+test("injects a stable prompt_cache_key for Mistral Chat Completions", async () => {
+  const opts = {
+    translatedBody: {
+      model: "mistral-small-latest",
+      messages: [
+        { role: "system", content: "stable coding instructions" },
+        { role: "user", content: "fix this" },
+      ],
+    },
+    modelToCall: "mistral-small-latest",
+    provider: "mistral",
+    targetFormat: "openai",
+    credentials: { apiKey: "k" },
+  };
+  const first = await prepareUpstreamBody(opts);
+  const second = await prepareUpstreamBody({
+    ...opts,
+    translatedBody: {
+      ...opts.translatedBody,
+      messages: [...opts.translatedBody.messages, { role: "user", content: "and then this" }],
+    },
+  });
+  assert.match(String(first.prompt_cache_key), /^omni-[0-9a-f]{32}$/);
+  assert.equal(second.prompt_cache_key, first.prompt_cache_key);
+});
+
+test("injects a stable prompt_cache_key for Mistral Responses bodies", async () => {
+  const build = (extra: unknown[]) => ({
+    translatedBody: {
+      model: "labs-leanstral-1-5-1",
+      instructions: "stable coding instructions",
+      input: [{ role: "user", content: "fix this" }, ...extra],
+    },
+    modelToCall: "labs-leanstral-1-5-1",
+    provider: "mistral",
+    targetFormat: "openai-responses",
+    credentials: { apiKey: "k" },
+  });
+  const first = await prepareUpstreamBody(build([]));
+  const second = await prepareUpstreamBody(
+    build([
+      { role: "assistant", content: "ok" },
+      { role: "user", content: "more" },
+    ])
+  );
+  assert.match(String(first.prompt_cache_key), /^omni-[0-9a-f]{32}$/);
+  assert.equal(second.prompt_cache_key, first.prompt_cache_key);
+
+  const other = await prepareUpstreamBody({
+    ...build([]),
+    translatedBody: { ...build([]).translatedBody, instructions: "different instructions" },
+  });
+  assert.notEqual(other.prompt_cache_key, first.prompt_cache_key);
+});
+
+test("Mistral Responses body keeps a client-supplied prompt_cache_key and never gets one for other providers' Responses bodies", async () => {
+  const kept = await prepareUpstreamBody({
+    translatedBody: {
+      model: "labs-leanstral-1-5-1",
+      instructions: "x",
+      input: [],
+      prompt_cache_key: "client-key",
+    },
+    modelToCall: "labs-leanstral-1-5-1",
+    provider: "mistral",
+    targetFormat: "openai-responses",
+    credentials: { apiKey: "k" },
+  });
+  assert.equal(kept.prompt_cache_key, "client-key");
+
+  const none = await prepareUpstreamBody({
+    translatedBody: { model: "gpt-5", instructions: "x", input: [{ role: "user", content: "hi" }] },
+    modelToCall: "gpt-5",
+    provider: "openai",
+    targetFormat: "openai-responses",
+    credentials: { apiKey: "k" },
+  });
+  assert.equal(none.prompt_cache_key, undefined);
+});
+
 test("Codex Responses attempts reuse immutable input when no payload rules exist", async () => {
   setPayloadRulesConfig({});
   const input = [
@@ -987,4 +1067,68 @@ test("Codex attempts preserve caller-owned nested history with configured rules"
   } finally {
     resetPayloadRulesConfigForTests();
   }
+});
+
+// #18912: canonical `effort` also derives a `reasoning` object, the Responses envelope.
+// api.openai.com Chat Completions only documents `reasoning_effort`, so dropping `effort`
+// alone would trade "Unknown parameter: 'effort'" for "Unknown parameter: 'reasoning'".
+async function outboundOpenAIChat(provider: string, model: string, extra: object) {
+  const translatedBody = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.OPENAI,
+    model,
+    { model, messages: [{ role: "user", content: "Reply with OK" }], stream: false, ...extra },
+    false,
+    null,
+    provider
+  ) as Record<string, unknown>;
+  return prepareUpstreamBody({
+    translatedBody,
+    modelToCall: model,
+    provider,
+    targetFormat: FORMATS.OPENAI,
+    credentials: { apiKey: "x" },
+  });
+}
+
+test("#18912 canonical effort reaches OpenAI Chat Completions as reasoning_effort alone", async () => {
+  const out = await outboundOpenAIChat("openai", "gpt-6.1-terra", { effort: "high" });
+  assert.equal("effort" in out, false);
+  assert.equal("reasoning" in out, false);
+  assert.equal(out.reasoning_effort, "high");
+});
+
+test("#18912 a client reasoning.effort is folded onto reasoning_effort for OpenAI Chat", async () => {
+  const out = await outboundOpenAIChat("openai", "gpt-5.4", {
+    effort: "high",
+    reasoning: { effort: "low", summary: "auto" },
+  });
+  assert.equal("reasoning" in out, false);
+  assert.equal(out.reasoning_effort, "low");
+});
+
+test("#18912 explicit reasoning_effort outranks reasoning.effort on OpenAI Chat", async () => {
+  const out = await outboundOpenAIChat("openai", "gpt-5.4", {
+    reasoning_effort: "medium",
+    reasoning: { effort: "low" },
+  });
+  assert.equal("reasoning" in out, false);
+  assert.equal(out.reasoning_effort, "medium");
+});
+
+test("#18912 providers that accept the reasoning object keep it", async () => {
+  const out = await outboundOpenAIChat("openrouter", "openai/gpt-5.4", { effort: "high" });
+  assert.deepEqual(out.reasoning, { effort: "high" });
+  assert.equal(out.reasoning_effort, "high");
+});
+
+test("#18912 OpenAI Responses targets keep the reasoning object", async () => {
+  const out = await prepareUpstreamBody({
+    translatedBody: { model: "gpt-5.5-pro", input: "hi", reasoning: { effort: "high" } },
+    modelToCall: "gpt-5.5-pro",
+    provider: "openai",
+    targetFormat: FORMATS.OPENAI_RESPONSES,
+    credentials: { apiKey: "x" },
+  });
+  assert.deepEqual(out.reasoning, { effort: "high" });
 });

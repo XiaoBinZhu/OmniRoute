@@ -8,10 +8,10 @@
  * These tables drive the reconciliation / dedup / already-applied detection
  * paths in runMigrations(). The existing db-migration-runner.test.ts proves the
  * BEHAVIOUR is unchanged; this test PINS THE DATA so a bad move (a dropped row,
- * a transposed version, a corrupted sentinel) is caught immediately — the data
+ * a transposed version, a corrupted sentinel) is caught immediately 鈥?the data
  * is the thing the move could silently break.
  *
- * Pure value assertions — no DB handle is opened.
+ * Pure value assertions 鈥?no DB handle is opened.
  */
 
 import { describe, it } from "node:test";
@@ -26,9 +26,9 @@ import {
   OPTIONAL_FTS5_MIGRATION_VERSIONS,
 } from "../../src/lib/db/migrationRunner/constants.ts";
 
-// ── small tables — full snapshot ─────────────────────────────────────────────
+// 鈹€鈹€ small tables 鈥?full snapshot 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-describe("migrationRunner/constants — exact small-table snapshots", () => {
+describe("migrationRunner/constants 鈥?exact small-table snapshots", () => {
   it("LEGACY_VERSION_SLOT_MIGRATIONS is the 16-entry list, in order", () => {
     assert.deepEqual(
       LEGACY_VERSION_SLOT_MIGRATIONS.map((m) => `${m.version}:${m.name}`),
@@ -53,7 +53,7 @@ describe("migrationRunner/constants — exact small-table snapshots", () => {
     );
   });
 
-  it("SUPERSEDED_DUPLICATE_MIGRATIONS is the single 041→050 session_account_affinity entry", () => {
+  it("SUPERSEDED_DUPLICATE_MIGRATIONS is the single 041鈫?50 session_account_affinity entry", () => {
     assert.deepEqual(SUPERSEDED_DUPLICATE_MIGRATIONS, [
       {
         version: "041",
@@ -74,11 +74,85 @@ describe("migrationRunner/constants — exact small-table snapshots", () => {
   });
 });
 
-// ── large tables — count + shape + spot-checks (corruption guard) ─────────────
+// 鈹€鈹€ large tables 鈥?count + shape + spot-checks (corruption guard) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-describe("migrationRunner/constants — large-table integrity", () => {
-  it("RENAMED_MIGRATION_COMPATIBILITY has 43 well-formed entries", () => {
-    assert.equal(RENAMED_MIGRATION_COMPATIBILITY.length, 43);
+describe("migrationRunner/constants 鈥?large-table integrity", () => {
+  it("RENAMED_MIGRATION_COMPATIBILITY has 113 well-formed entries", () => {
+    assert.equal(RENAMED_MIGRATION_COMPATIBILITY.length, 113);
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter(
+        (entry) => entry.fromName === "usage_history_calculated_cost"
+      ),
+      ["228", "231", "233", "236"].map((fromVersion) => ({
+        fromVersion,
+        fromName: "usage_history_calculated_cost",
+        toVersion: "237",
+        toName: "usage_history_calculated_cost",
+      }))
+    );
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter((entry) => entry.fromName === "agent_sessions"),
+      ["190", "197", "198", "208", "214", "229", "230"].map((fromVersion) => ({
+        fromVersion,
+        fromName: "agent_sessions",
+        toVersion: "234",
+        toName: "agent_sessions",
+      }))
+    );
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter(
+        (entry) => entry.fromName === "usage_history_agent_session_id"
+      ),
+      ["191", "198", "199", "209", "215", "230", "231"].map((fromVersion) => ({
+        fromVersion,
+        fromName: "usage_history_agent_session_id",
+        toVersion: "235",
+        toName: "usage_history_agent_session_id",
+      }))
+    );
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter((entry) => entry.fromName === "key_templates"),
+      ["228", "230", "231", "232", "234"].map((fromVersion) => ({
+        fromVersion,
+        fromName: "key_templates",
+        toVersion: "236",
+        toName: "key_templates",
+      }))
+    );
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter((entry) => entry.fromName === "daily_cached_input"),
+      ["206", "213", "214", "215", "217", "218", "223", "224", "225", "226", "228", "229"].map(
+        (fromVersion) => ({
+          fromVersion,
+          fromName: "daily_cached_input",
+          toVersion: "231",
+          toName: "daily_cached_input",
+        })
+      )
+    );
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter((entry) => entry.fromName === "proxy_payload_traffic"),
+      [
+        "206",
+        "207",
+        "213",
+        "214",
+        "215",
+        "217",
+        "218",
+        "223",
+        "224",
+        "225",
+        "226",
+        "228",
+        "229",
+      ].map((fromVersion) => ({
+        fromVersion,
+        fromName: "proxy_payload_traffic",
+        toVersion: "232",
+        toName: "proxy_payload_traffic",
+      }))
+    );
     for (const e of RENAMED_MIGRATION_COMPATIBILITY) {
       assert.equal(typeof e.fromVersion, "string");
       assert.equal(typeof e.fromName, "string");
@@ -95,7 +169,7 @@ describe("migrationRunner/constants — large-table integrity", () => {
       toVersion: "025",
       toName: "call_logs_summary_storage",
     });
-    // both manifest_routing collisions (052→059 and 056→059) must survive
+    // both manifest_routing collisions (052鈫?59 and 056鈫?59) must survive
     const manifest = RENAMED_MIGRATION_COMPATIBILITY.filter((e) => e.toName === "manifest_routing");
     assert.deepEqual(manifest.map((e) => e.fromVersion).sort(), ["052", "056"]);
     const devin = RENAMED_MIGRATION_COMPATIBILITY.filter(
@@ -131,55 +205,97 @@ describe("migrationRunner/constants — large-table integrity", () => {
         toName: "inspector_custom_hosts",
       }
     );
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-8), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-29), {
       fromVersion: "134",
       fromName: "ccr_blocks",
       toVersion: "139",
       toName: "ccr_blocks",
     });
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-7), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-28), {
       fromVersion: "139",
       fromName: "job_registry",
       toVersion: "146",
       toName: "job_registry",
     });
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-6), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-27), {
       fromVersion: "143",
       fromName: "radar_local_model_state",
       toVersion: "153",
       toName: "radar_local_model_state",
     });
     // npm 3.8.50 shipped model_capabilities as 163; it now lives at 169
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-5), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-26), {
       fromVersion: "163",
       fromName: "model_capabilities",
       toVersion: "169",
       toName: "model_capabilities",
     });
     // #12036: renamed migrations 056/073/077/101 appended as compatibility renames
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-4), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-25), {
       fromVersion: "056",
       fromName: "provider_default",
       toVersion: "056",
       toName: "mcp_accessibility_compression",
     });
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-3), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-24), {
       fromVersion: "073",
       fromName: "discovery_results",
       toVersion: "073",
       toName: "per_model_token_limits",
     });
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-2), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-23), {
       fromVersion: "077",
       fromName: "plugin_metrics",
       toVersion: "077",
       toName: "api_key_stream_default_mode",
     });
-    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-1), {
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-22), {
       fromVersion: "101",
       fromName: "proxy_pool_rotation",
       toVersion: "101",
       toName: "api_key_usage_limits",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-21), {
+      fromVersion: "194",
+      fromName: "api_key_self_service_settings",
+      toVersion: "233",
+      toName: "api_key_self_service_settings",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-20), {
+      fromVersion: "197",
+      fromName: "api_key_self_service_settings",
+      toVersion: "233",
+      toName: "api_key_self_service_settings",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-19), {
+      fromVersion: "207",
+      fromName: "api_key_self_service_settings",
+      toVersion: "233",
+      toName: "api_key_self_service_settings",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-18), {
+      fromVersion: "206",
+      fromName: "recreate_turn_nodes_content_hash_index",
+      toVersion: "211",
+      toName: "recreate_turn_nodes_content_hash_index",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-17), {
+      fromVersion: "213",
+      fromName: "api_key_self_service_settings",
+      toVersion: "233",
+      toName: "api_key_self_service_settings",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-16), {
+      fromVersion: "228",
+      fromName: "api_key_self_service_settings",
+      toVersion: "233",
+      toName: "api_key_self_service_settings",
+    });
+    assert.deepEqual(RENAMED_MIGRATION_COMPATIBILITY.at(-15), {
+      fromVersion: "229",
+      fromName: "api_key_self_service_settings",
+      toVersion: "233",
+      toName: "api_key_self_service_settings",
     });
   });
 
@@ -195,16 +311,34 @@ describe("migrationRunner/constants — large-table integrity", () => {
     );
   });
 
-  it("name-locks the fork nest-billing renumbering to 229-232", () => {
+  it("rehomes the earlier 236/237 pending-detail index heads to 239 (#19573)", () => {
     assert.deepEqual(
       RENAMED_MIGRATION_COMPATIBILITY.filter(
-        (entry) => Number(entry.toVersion) >= 229 && Number(entry.toVersion) <= 232
+        (entry) => entry.fromName === "call_logs_pending_detail_index"
+      ),
+      ["236", "237"].map((fromVersion) => ({
+        fromVersion,
+        fromName: "call_logs_pending_detail_index",
+        toVersion: "239",
+        toName: "call_logs_pending_detail_index",
+      }))
+    );
+  });
+
+  it("name-locks the fork nest-billing renumbering to 242-245", () => {
+    assert.deepEqual(
+      RENAMED_MIGRATION_COMPATIBILITY.filter(
+        (entry) => Number(entry.toVersion) >= 242 && Number(entry.toVersion) <= 245
       ),
       [
-        ["215", "nest_billing", "229"],
-        ["216", "nest_billing_outbox_backoff", "230"],
-        ["217", "call_logs_nest_cost", "231"],
-        ["218", "call_logs_timestamp_id", "232"],
+        ["215", "nest_billing", "242"],
+        ["216", "nest_billing_outbox_backoff", "243"],
+        ["217", "call_logs_nest_cost", "244"],
+        ["218", "call_logs_timestamp_id", "245"],
+        ["229", "nest_billing", "242"],
+        ["230", "nest_billing_outbox_backoff", "243"],
+        ["231", "call_logs_nest_cost", "244"],
+        ["232", "call_logs_timestamp_id", "245"],
       ].map(([fromVersion, fromName, toVersion]) => ({
         fromVersion,
         fromName,

@@ -1,7 +1,7 @@
 ---
 title: "Claude Code CLI — Configuration with OmniRoute"
 version: 3.8.40
-lastUpdated: 2026-07-24
+lastUpdated: 2026-11-18
 ---
 
 # Claude Code CLI — Configuration with OmniRoute
@@ -58,6 +58,67 @@ See [`docs/security/ENTRA_SSO.md`](../security/ENTRA_SSO.md).
 `omniroute launch` sets all of these for you: it resolves the base URL + token
 from the active context (so `omniroute connect <vps>` then `omniroute launch`
 just works), health-checks the server, and execs `claude`.
+
+---
+
+## Usage attribution: sessions and projects
+
+OmniRoute groups each API key's requests into **agent sessions** and records which **project**
+each session worked on (`agent_sessions` table), so usage and cost can be reported per team member,
+per project and per session.
+
+What is recorded without any client setup:
+
+| Field   | Source                                                                                                                                                         |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Session | `x-claude-code-session-id` header (same value as `metadata.user_id.session_id`), stable per session                                                            |
+| Project | The `Primary working directory:` line Claude Code sends in its environment message; worktree folders under `.claude/worktrees/` resolve to the repository name |
+| Branch  | `Current branch:` from the git status Claude Code sends with the first message                                                                                 |
+| Client  | `user-agent` (`claude-cli/<version>`)                                                                                                                          |
+
+Codex (`<environment_context><cwd>`) and OpenCode (`x-opencode-session`) are recognized the same
+way. Keys with **no-log** enabled keep only the session id and header-supplied project fields;
+nothing read from the prompt (path, branch) is stored.
+
+### Naming the project explicitly (recommended)
+
+The working directory differs between machines, so the same repository can show up under different
+paths. Send the project explicitly instead: Claude Code adds any headers listed in
+`ANTHROPIC_CUSTOM_HEADERS` to every model request, and OmniRoute reads two of them:
+
+| Header                     | Value                                                       |
+| -------------------------- | ----------------------------------------------------------- |
+| `x-omniroute-project`      | Project name, e.g. `omniroute`                              |
+| `x-omniroute-project-repo` | Normalized remote, e.g. `github.com/diegosouzapw/OmniRoute` |
+
+Both are only read for attribution; they are never forwarded to the upstream provider.
+
+`ANTHROPIC_CUSTOM_HEADERS` is read once at startup, and settings files store literal values, so
+compute it when Claude Code launches. Add this to `~/.zshrc` or `~/.bashrc` and keep starting
+`claude` from the project folder:
+
+```bash
+claude() {
+  local common name repo
+  if common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    case $common in
+      */.git) name=$(basename "$(dirname "$common")") ;;  # repository name, also in worktrees
+      *) name=$(basename "$common" .git) ;;                # bare repository (/srv/foo.git)
+    esac
+    repo=$(git remote get-url origin 2>/dev/null \
+      | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^@/]*@)?##; s#^[^@/]+@([^:]+):#\1/#; s|[?#].*$||; s#\.git$##')
+  else
+    name=$(basename "$PWD")                                # not a git repository: folder name
+  fi
+  ANTHROPIC_CUSTOM_HEADERS="${ANTHROPIC_CUSTOM_HEADERS:+${ANTHROPIC_CUSTOM_HEADERS}
+}x-omniroute-project: ${name}${repo:+
+x-omniroute-project-repo: ${repo}}" command claude "$@"
+}
+```
+
+The `sed` expression strips any credentials, query string and fragment embedded in the remote URL,
+and headers already in `ANTHROPIC_CUSTOM_HEADERS` are kept. IDE extensions launch
+Claude Code without your shell, so their sessions fall back to the working directory.
 
 ---
 
@@ -265,6 +326,28 @@ unprefixed Claude models** — the toggle on the Claude provider page, or
 `OMNIROUTE_PREFER_CLAUDE_CODE_FOR_UNPREFIXED_CLAUDE_MODELS=true` (default off;
 see [Environment](../reference/ENVIRONMENT.md)) — which routes bare `claude-*`
 IDs to Claude Code instead. Explicit provider prefixes always win.
+
+**"auto mode … this session isn't eligible" (classifier requests billed)** — in
+auto mode Claude Code asks the server to review actions inside its own model
+requests ([Anthropic docs](https://code.claude.com/docs/en/auto-mode-classifier-billing)).
+That needs the `anthropic-beta` value `dangerous-tool-use-2026-09-03` and the
+`safeguards` body field to reach Anthropic as a pair, and `safeguard_results`
+plus the upstream tool-use IDs to come back unchanged. OmniRoute does this when
+the request is routed to the native `claude` provider or to an
+`anthropic-compatible-*` node, streamed or not (regression guard:
+`tests/integration/claude-auto-mode-classifier-e2e.test.ts`). Other targets
+cannot return the review, so Claude Code falls back to its own classifier
+requests and shows the notice:
+
+- a model on a non-Anthropic provider, or a combo that lands on one;
+- a Claude-Code-compatible relay node (`anthropic-compatible-cc-*`), which
+  rebuilds the request body and does not carry `safeguards`;
+- an older OmniRoute that predates the allowlisted betas, or a Claude Code
+  version below the one the Anthropic page lists for gateway sessions.
+
+Run `/status` in Claude Code: the **Auto mode server** row reads `Enabled`
+while the server's review is active. Whether those requests are billed is
+decided by Anthropic, not by OmniRoute.
 
 **Auth errors** — the profile holds no token. Use `omniroute launch --profile`
 (injects it) or export `ANTHROPIC_AUTH_TOKEN`.

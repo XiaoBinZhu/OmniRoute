@@ -31,6 +31,7 @@ import {
   antigravityPersistStatus,
 } from "@/lib/oauth/antigravityProjectGate";
 import { syncToCloud } from "@/lib/cloudSync";
+import { triggerAutoModelSync } from "@/lib/providerModels/autoModelSyncTrigger";
 import { startLocalServer } from "@/lib/oauth/utils/server";
 import { runWithProxyContextOrDirect } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import {
@@ -74,6 +75,7 @@ const NO_PKCE_DEVICE_CODE_PROVIDERS = new Set([
   "github",
   "kimi-coding",
   "kilocode",
+  "megabrain",
   "codebuddy-cn",
   "freebuff",
   "codebuddy-intl",
@@ -593,8 +595,8 @@ export async function POST(
         const matchId = typeof match?.id === "string" ? match.id : null;
         if (matchId) {
           connection = await updateProviderConnection(matchId, {
-            ...buildOAuthTokenUpdate(tokenData, expiresAt),
-            ...antigravityPersistStatus(degradedProject),
+            ...buildOAuthTokenUpdate(tokenData, expiresAt, match),
+            ...(degradedProject ? antigravityPersistStatus(degradedProject) : {}),
             isActive: true,
           });
         }
@@ -606,6 +608,9 @@ export async function POST(
       }
 
       // Auto sync to Cloud if enabled
+      // A connection added here has no catalog until its first sync; the
+      // scheduler only reaches it on the next six-hour tick.
+      triggerAutoModelSync(connection);
       await syncToCloudIfEnabled();
 
       return NextResponse.json({
@@ -685,7 +690,7 @@ export async function POST(
           const matchId = typeof match?.id === "string" ? match.id : null;
           if (matchId) {
             connection = await updateProviderConnection(matchId, {
-              ...buildOAuthTokenUpdate(result.tokens, expiresAt),
+              ...buildOAuthTokenUpdate(result.tokens, expiresAt, match),
               testStatus: "active",
               isActive: true,
             });
@@ -698,6 +703,9 @@ export async function POST(
         }
 
         // Auto sync to Cloud if enabled
+        // A connection added here has no catalog until its first sync; the
+        // scheduler only reaches it on the next six-hour tick.
+        triggerAutoModelSync(connection);
         await syncToCloudIfEnabled();
 
         return NextResponse.json({
@@ -823,8 +831,8 @@ export async function POST(
           const matchId = typeof match?.id === "string" ? match.id : null;
           if (matchId) {
             connection = await updateProviderConnection(matchId, {
-              ...buildOAuthTokenUpdate(tokenData, expiresAt),
-              ...antigravityPersistStatus(degradedProject),
+              ...buildOAuthTokenUpdate(tokenData, expiresAt, match),
+              ...(degradedProject ? antigravityPersistStatus(degradedProject) : {}),
               isActive: true,
             });
           }
@@ -835,6 +843,9 @@ export async function POST(
           );
         }
 
+        // A connection added here has no catalog until its first sync; the
+        // scheduler only reaches it on the next six-hour tick.
+        triggerAutoModelSync(connection);
         await syncToCloudIfEnabled();
 
         return NextResponse.json({
@@ -908,8 +919,8 @@ export async function POST(
         const matchId = typeof match?.id === "string" ? match.id : null;
         if (matchId) {
           connection = await updateProviderConnection(matchId, {
-            ...buildOAuthTokenUpdate(keepDeviceIdentity(tokenData, match), expiresAt),
-            ...antigravityPersistStatus(degradedProject),
+            ...buildOAuthTokenUpdate(keepDeviceIdentity(tokenData, match), expiresAt, match),
+            ...(degradedProject ? antigravityPersistStatus(degradedProject) : {}),
             isActive: true,
           });
         }
@@ -919,6 +930,9 @@ export async function POST(
           );
         }
 
+        // A connection added here has no catalog until its first sync; the
+        // scheduler only reaches it on the next six-hour tick.
+        triggerAutoModelSync(connection);
         await syncToCloudIfEnabled();
 
         return NextResponse.json({

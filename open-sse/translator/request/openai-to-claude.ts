@@ -1,7 +1,6 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 // CLAUDE_SYSTEM_PROMPT import removed — no longer injected unconditionally (#1966/#2130)
-import { supportsClaudeMaxEffort, supportsXHighEffort } from "../../config/providerModels.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
 import { normalizeClaudeToolInputSchema, sanitizeToolId } from "../helpers/schemaCoercion.ts";
 import { safeParseJSON } from "../helpers/jsonUtil.ts";
@@ -11,11 +10,8 @@ import {
   createDefaultClaudeCacheControl,
 } from "../helpers/claudeHelper.ts";
 import { restoreClaudeThinkingBlocks } from "../../services/claudeThinkingStore.ts";
-import {
-  getDefaultThinkingBudget,
-  isAdaptiveThinkingOnly,
-} from "../../../src/shared/constants/modelSpecs.ts";
 import { fitThinkingToMaxTokens } from "./openai-to-claude/thinkingBudget.ts";
+import { claudeThinkingFromOpenAIRequest } from "./openai-to-claude/thinkingConfig.ts";
 import { enforceToolResultAdjacency } from "./openai-to-claude/toolResultAdjacency.ts";
 import { unwrapOpenAIToolDefinition } from "./openai-to-claude/unwrapToolDefinition.ts";
 import { resolveToolResultId } from "./openai-to-claude/sanitizeToolResultId.ts";
@@ -23,16 +19,6 @@ import {
   openAiImagePartToClaudeBlock,
   normalizeToolResultImages,
 } from "./openai-to-claude/imageBlocks.ts";
-
-// Reasoning-effort levels Anthropic accepts on `output_config.effort`. Used to steer
-// adaptive-only Claude models (Opus 4.7+/Fable 5) without ever emitting a manual budget.
-const ADAPTIVE_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
-
-// Safe manual budget when `thinking:{type:"adaptive"}` must be downgraded to the
-// compatible manual `type:"enabled"` form for a model that does not support adaptive
-// thinking (#10119). 1024 is both Anthropic's MIN thinking budget (thinkingBudget.ts)
-// and the `low` effort bucket — conservative for small-context models like Haiku.
-const ADAPTIVE_DOWNGRADE_BUDGET = 1024;
 
 // Prefix for Claude OAuth tool names to avoid conflicts
 // Can be disabled per-request via body._disableToolPrefix = true
@@ -147,6 +133,11 @@ export function stripEmptyTextBlocks(content: unknown[] | undefined): unknown[] 
     });
 }
 
+/** A message `content` that is one bare block object becomes a one-item block array. */
+function wrapBareContentBlock(content: unknown): unknown {
+  return content && typeof content === "object" && !Array.isArray(content) ? [content] : content;
+}
+
 /**
  * T15: Normalize content to string form.
  * Handles both string and array-of-blocks forms (Cursor, Codex 2.x, etc.).
@@ -155,8 +146,9 @@ export function stripEmptyTextBlocks(content: unknown[] | undefined): unknown[] 
 export function normalizeContentToString(content: string | unknown[] | null | undefined): string {
   if (!content) return "";
   if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return (content as Array<Record<string, unknown>>)
+  const blocks = wrapBareContentBlock(content);
+  if (Array.isArray(blocks)) {
+    return (blocks as Array<Record<string, unknown>>)
       .filter((b) => b.type === "text")
       .map((b) => String(b.text ?? ""))
       .join("\n");
@@ -214,7 +206,10 @@ export function openaiToClaudeRequest(
   // For models that don't force thinking (haiku, older sonnets), preserve temperature.
   // Note: Opus 4.7+/Fable 5 already drop sampling params upstream of the translator via
   // the registry `unsupportedParams` strip; this covers the remaining 4.x families.
-  const modelForcesThinking = /claude-(?:opus|sonnet)-4/i.test(String(model));
+  // Only the OAuth provider forces thinking; API-key and compatible providers keep temperature.
+  const modelForcesThinking =
+    (routedProvider === undefined || routedProvider === "claude") &&
+    /claude-(?:opus|sonnet)-4/i.test(String(model));
   if (body.temperature !== undefined && !modelForcesThinking) {
     result.temperature = body.temperature;
   }
@@ -238,77 +233,21 @@ export function openaiToClaudeRequest(
   // `result.messages`/`toolNameMap`, so moving it earlier is safe.
   if (isKimiCoding) {
     applyKimiCodingThinking(result, body);
-  } else if (body.thinking) {
-    const thinkingType = body.thinking.type || "enabled";
-    if (thinkingType === "adaptive" && !isAdaptiveThinkingOnly(model)) {
-      // Downgrade guard (#10119): a request can carry `thinking:{type:"adaptive"}` — the
-      // shape built for an adaptive-only sibling (Opus 4.7+/Sonnet-5) in a combo — and be
-      // re-routed by combo/fallback to a model that only accepts manual extended thinking
-      // (e.g. claude-haiku-4-5-20251001). Anthropic rejects `adaptive` on those models with
-      // "adaptive thinking is not supported on this model". Convert to the compatible manual
-      // `enabled` form with a safe budget instead of forwarding an incompatible type.
-      const callerBudget = Number(body.thinking.budget_tokens);
-      const safeBudget =
-        (Number.isFinite(callerBudget) && callerBudget > 0 ? callerBudget : 0) ||
-        getDefaultThinkingBudget(model) ||
-        ADAPTIVE_DOWNGRADE_BUDGET;
-      result.thinking = { type: "enabled", budget_tokens: safeBudget };
-    } else {
-      result.thinking = {
-        type: thinkingType,
-        ...(body.thinking.budget_tokens && { budget_tokens: body.thinking.budget_tokens }),
-        ...(body.thinking.max_tokens && { max_tokens: body.thinking.max_tokens }),
-      };
-    }
-  } else if (body.reasoning_effort) {
-    // Convert OpenAI reasoning_effort to Claude thinking format (#627)
-    // Clients like OpenCode send reasoning_effort via @ai-sdk/openai-compatible
-    const requestedEffort = String(body.reasoning_effort).toLowerCase();
-    const normalizedEffort =
-      requestedEffort === "max" && !supportsClaudeMaxEffort(model)
-        ? "high"
-        : requestedEffort === "xhigh" && !supportsXHighEffort("claude", model)
-          ? "high"
-          : requestedEffort;
-    if (isAdaptiveThinkingOnly(model)) {
-      // Opus 4.7+/Fable 5 removed manual extended thinking: a fixed `budget_tokens`
-      // (or `type:"enabled"`) is a hard 400. Steer EVERY level via adaptive +
-      // output_config.effort instead of the budget buckets below. Unrecognized levels
-      // leave thinking unset so the model keeps its adaptive default rather than 400ing
-      // on an invalid effort value.
-      if (ADAPTIVE_EFFORT_LEVELS.has(normalizedEffort)) {
-        result.thinking = {
-          type: "adaptive",
-        };
-        result.output_config = {
-          ...(result.output_config || {}),
-          effort: normalizedEffort,
-        };
-      }
-    } else if (normalizedEffort === "max" || normalizedEffort === "xhigh") {
-      result.thinking = {
-        type: "adaptive",
-      };
-      result.output_config = {
-        ...(result.output_config || {}),
-        effort: normalizedEffort,
-      };
-    } else {
-      const effortBudgetMap: Record<string, number> = {
-        low: 1024,
-        medium: 10240,
-        high: 131072,
-        max: 131072,
-      };
-      const budget = effortBudgetMap[normalizedEffort];
-      if (budget !== undefined && budget > 0) {
-        result.thinking = {
-          type: "enabled",
-          budget_tokens: budget,
-        };
-      }
+  } else {
+    const mapped = claudeThinkingFromOpenAIRequest(body, model);
+    if (mapped.thinking) result.thinking = mapped.thinking;
+    if (mapped.effort) {
+      result.output_config = { ...(result.output_config || {}), effort: mapped.effort };
     }
   }
+
+  // Forced tools and extended thinking cannot be combined on Claude-compatible APIs.
+  const requestedToolChoice = extractAllowedTools(body.tool_choice);
+  const thinkingToolChoice = requestedToolChoice
+    ? convertAllowedToolsChoice(requestedToolChoice)
+    : convertOpenAIToolChoice(body.tool_choice);
+  const forcedType = thinkingToolChoice?.type;
+  if (!isKimiCoding && forcedType && !["auto", "none"].includes(forcedType)) delete result.thinking;
 
   // Fit thinking budget within the model's output cap and ensure
   // max_tokens > budget_tokens for all thinking configurations (#627).
@@ -337,7 +276,11 @@ export function openaiToClaudeRequest(
   // `body.reasoning_effort` (manual budget or adaptive effort), drop temperature
   // defensively. The model-name strip earlier already covers Claude OAuth's
   // forced-thinking case (claude-opus-4.x / claude-sonnet-4.x).
-  if (result.thinking && result.temperature !== undefined) {
+  if (
+    result.thinking &&
+    (result.thinking as Record<string, unknown>).type !== "disabled" &&
+    result.temperature !== undefined
+  ) {
     delete result.temperature;
   }
 
@@ -355,9 +298,10 @@ export function openaiToClaudeRequest(
     // for system-level instructions, and it must reach the Claude system field, not become an assistant turn.
     for (const msg of body.messages) {
       if (msg.role === "system" || msg.role === "developer") {
-        systemParts.push(
-          typeof msg.content === "string" ? msg.content : normalizeContentToString(msg.content)
-        );
+        const text =
+          typeof msg.content === "string" ? msg.content : normalizeContentToString(msg.content);
+        // Anthropic rejects an empty text block (400), so an empty system turn adds nothing.
+        if (text) systemParts.push(text);
       }
     }
 
@@ -590,6 +534,28 @@ export function openaiToClaudeRequest(
     }
   }
 
+  // Anthropic answers 400 "must define tools" when the history holds tool_use blocks but the
+  // request declares no tools (an agent that loaded its tools late). Declare each called tool
+  // as a stub and forbid calling it. Names Anthropic would reject are skipped.
+  if (!result.tools?.length) {
+    const stubNames = new Set<string>();
+    for (const message of result.messages) {
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block.type === "tool_use" && /^[a-zA-Z0-9_-]{1,128}$/.test(String(block.name))) {
+          stubNames.add(String(block.name));
+        }
+      }
+    }
+    if (stubNames.size > 0) {
+      result.tools = [...stubNames].map((name) => ({
+        name,
+        description: "Called earlier in this conversation; not available now.",
+        input_schema: { type: "object", properties: {} },
+      }));
+      result.tool_choice = { type: "none" };
+    }
+  }
+
   // response_format: inject JSON structured output instruction into system prompt.
   // Claude doesn't natively support response_format, so we insert a system-level instruction.
   // NOTE: systemParts are consumed later (after this block) — they're accumulated here.
@@ -699,12 +665,13 @@ function getContentBlocksFromMessage(
       ...(toolResultCacheControl !== undefined && { cache_control: toolResultCacheControl }),
     });
   } else if (msg.role === "user") {
-    if (typeof msg.content === "string") {
-      if (msg.content) {
-        blocks.push({ type: "text", text: msg.content });
+    const userContent = wrapBareContentBlock(msg.content);
+    if (typeof userContent === "string") {
+      if (userContent) {
+        blocks.push({ type: "text", text: userContent });
       }
-    } else if (Array.isArray(msg.content)) {
-      for (const part of msg.content) {
+    } else if (Array.isArray(userContent)) {
+      for (const part of userContent) {
         if (part.type === "text" && part.text) {
           blocks.push({ type: "text", text: part.text });
         } else if (part.type === "tool_result") {
@@ -741,19 +708,27 @@ function getContentBlocksFromMessage(
           // native video input, so non-pdf/non-image files are skipped here.
           const fileData = part.file.file_data || part.file.data;
           const fmatch =
-            typeof fileData === "string" ? fileData.match(/^data:([^;]+);base64,(.+)$/) : null;
+            typeof fileData === "string" ? fileData.match(/^data:([^;]+);base64,([\s\S]+)$/) : null;
           if (fmatch) {
             const mediaType = fmatch[1];
             if (mediaType === "application/pdf") {
               blocks.push({
                 type: "document",
-                source: { type: "base64", media_type: mediaType, data: fmatch[2] },
+                source: {
+                  type: "base64",
+                  media_type: mediaType,
+                  data: fmatch[2].replace(/\s+/g, ""),
+                },
                 ...(part.file.filename ? { title: part.file.filename } : {}),
               });
             } else if (mediaType.startsWith("image/")) {
               blocks.push({
                 type: "image",
-                source: { type: "base64", media_type: mediaType, data: fmatch[2] },
+                source: {
+                  type: "base64",
+                  media_type: mediaType,
+                  data: fmatch[2].replace(/\s+/g, ""),
+                },
               });
             }
           } else if (typeof fileData === "string" && /^https?:\/\//i.test(fileData)) {
@@ -786,7 +761,9 @@ function getContentBlocksFromMessage(
           // prepareClaudeRequest treats any non-empty signature on the latest assistant turn as
           // genuine and forwards the block verbatim, so the fake signature 400s upstream. This
           // mirrors the stricter "non-empty string" check already used in claudeHelper.ts.
-          if (part.type === "thinking" && !part.signature) {
+          // Kimi ignores signatures (prepareClaudeRequest strips the field), so its
+          // unsigned block keeps the reasoning text it must see on replay.
+          if (part.type === "thinking" && !part.signature && !isKimiCoding) {
             continue; // drop — no replayable signature (empty or absent)
           }
           if (part.type === "redacted_thinking" && part.data === "") {
@@ -907,8 +884,16 @@ function getContentBlocksFromMessage(
         hasThinkingBlock = true;
       }
     }
-    if (isKimiCoding && typeof msg.reasoning_content === "string" && !hasThinkingBlock) {
-      blocks.unshift({ type: "thinking", thinking: msg.reasoning_content });
+    if (isKimiCoding && typeof msg.reasoning_content === "string") {
+      if (!hasThinkingBlock) {
+        blocks.unshift({ type: "thinking", thinking: msg.reasoning_content });
+      } else if (msg.reasoning_content.trim()) {
+        // Only empty thinking blocks: they must not hide the reasoning the client sent.
+        const thinkingBlocks = blocks.filter((b) => b.type === "thinking");
+        const hasText = thinkingBlocks.some((b) => String(b.thinking ?? "").trim());
+        if (thinkingBlocks.length > 0 && !hasText)
+          thinkingBlocks[0].thinking = msg.reasoning_content;
+      }
     }
     // A store miss injects nothing: adaptive thinking has no precursor requirement, and
     // prepareClaudeRequest disables manual thinking when the final tool turn has no

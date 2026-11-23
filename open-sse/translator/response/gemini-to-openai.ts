@@ -5,6 +5,7 @@ import {
   storeGeminiThoughtSignature,
 } from "../../services/geminiThoughtSignatureStore.ts";
 import { caseInsensitiveToolNameLookup } from "../helpers/toolCallHelper.ts";
+import { stripGeminiPlaceholderArgs } from "../helpers/geminiPlaceholderArgs.ts";
 import {
   parseTextualToolCallCandidate,
   containsTextualToolCallMarker,
@@ -24,10 +25,13 @@ type GeminiToOpenAIState = {
   hasEmittedContent?: boolean;
   messageId: string;
   model: string;
+  emittedCallIndexes?: Map<string, number>;
   pendingThoughtSignature?: string | null;
   signatureNamespace?: string | null;
   toolCalls: Map<number, unknown>;
   toolNameMap?: Map<string, string>;
+  /** The CLIENT request's tools[], used to drop the synthetic `reason` argument. */
+  clientTools?: unknown;
   textualToolCallBuffer?: string;
   textualReasoningTagBuffer?: string;
   activeTextualReasoningTag?: string;
@@ -263,8 +267,29 @@ function emitFunctionCallPart(
 ) {
   const rawToolName = part.functionCall.name;
   const fcName = caseInsensitiveToolNameLookup(rawToolName, state.toolNameMap) ?? rawToolName;
-  const fcArgs = normalizeToolCallArgs(part.functionCall.args || {});
+  const fcArgs = stripGeminiPlaceholderArgs(
+    fcName,
+    normalizeToolCallArgs(part.functionCall.args || {}),
+    state.clientTools
+  );
+  // Some providers re-send a growing snapshot of the same function call on
+  // later chunks (id stays stable, args carry the full history so far).
+  // Emitting each snapshot as a fresh tool call duplicates the delta stream:
+  // clients concatenate per-index arguments and reassemble corrupted JSON
+  // (#19183). The first occurrence carries the complete call, and a serialized
+  // snapshot can never prefix-extend a complete JSON object (the closing
+  // brace shifts), so there is no valid incremental-delta representation for
+  // a repeat: it is dropped (same rule as the CLOVA translator's
+  // terminal-frame dedup). Each provider call therefore surfaces exactly once.
+  const providerCallId = part.functionCall.id;
+  const hasProviderCallId = typeof providerCallId === "string" && providerCallId.length > 0;
+  if (hasProviderCallId && (state.emittedCallIndexes ??= new Map()).has(providerCallId)) {
+    return;
+  }
   const toolCallIndex = state.functionIndex++;
+  if (hasProviderCallId) {
+    state.emittedCallIndexes!.set(providerCallId, toolCallIndex);
+  }
   const toolCall = {
     id: buildToolCallId(part.functionCall, fcName, toolCallIndex),
     index: toolCallIndex,
@@ -431,7 +456,12 @@ export function geminiToOpenAIResponse(chunk, state) {
         // following functionCall is cached and can be re-attached on later
         // turns; otherwise OpenAI-format clients lose the signature and the
         // next Gemini request has to stringify historical tool calls.
-        if (hasThoughtSig && !hasTextContent && !hasFunctionCall) {
+        if (
+          hasThoughtSig &&
+          !hasTextContent &&
+          !hasFunctionCall &&
+          !(part.inlineData || part.inline_data)
+        ) {
           continue;
         }
 
@@ -469,7 +499,7 @@ export function geminiToOpenAIResponse(chunk, state) {
           }
           emitFunctionCallPart(part, state, results);
         }
-        continue;
+        if (!(hasThoughtSig && (part.inlineData || part.inline_data))) continue;
       }
 
       // Text content (non-thinking). Some Gemini/Antigravity turns can imitate
@@ -807,6 +837,13 @@ export function geminiToOpenAIResponse(chunk, state) {
           ],
         });
       }
+    }
+
+    // A tag prefix held at a chunk boundary ("<", "<th") never became a tag: it is text.
+    // flushOpenTextualReasoning above already cleared it when a reasoning tag was open.
+    if (state.textualReasoningTagBuffer) {
+      emitTextDelta(state.textualReasoningTagBuffer, state, results);
+      state.textualReasoningTagBuffer = undefined;
     }
 
     // Live incident (dashboard log id 1784489701456-d8c0e9): MALFORMED_FUNCTION_CALL /

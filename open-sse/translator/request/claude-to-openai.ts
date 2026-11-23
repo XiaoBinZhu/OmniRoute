@@ -41,8 +41,39 @@ function normalizeToolSchema(schema: unknown): Record<string, unknown> {
 
 function normalizeOpenAIReasoningEffort(effort: unknown): string | undefined {
   if (typeof effort !== "string") return undefined;
-  const normalized = effort.toLowerCase();
+  const normalized = effort.trim().toLowerCase();
   return normalized || undefined;
+}
+
+// The turn's effort is the last role=system directive that carries one (Claude Code
+// mid-conversation directive); the top-level output_config is only the cached default.
+function lastSystemDirectiveEffort(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "system") continue;
+    const effort = normalizeOpenAIReasoningEffort(message.output_config?.effort);
+    if (effort) return effort;
+  }
+  return undefined;
+}
+
+// The steps that run before this translator (thinking mode, forced reasoning rules, role
+// normalization) only see the top-level output_config.effort. Move the directive's effort
+// there first, so Auto strips it, a forced rule replaces it and a model without a system role
+// cannot lose it. The directives give up their copy, so it is not read a second time here.
+export function hoistSystemDirectiveEffort<T>(body: T): T {
+  const record = body as unknown as JsonRecord | null;
+  const effort = lastSystemDirectiveEffort(record?.messages);
+  if (!record || !effort) return body;
+  const messages = (record.messages as JsonRecord[]).map((message) => {
+    if (message?.role !== "system" || !message.output_config) return message;
+    const output_config = { ...(message.output_config as JsonRecord) };
+    delete output_config.effort;
+    return { ...message, output_config };
+  });
+  const output_config = { ...(record.output_config as JsonRecord | undefined), effort };
+  return { ...record, messages, output_config } as T;
 }
 
 function toStringArray(value: unknown): string[] {
@@ -123,6 +154,9 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   const routedProvider =
     credentials && typeof credentials === "object" ? (credentials as JsonRecord)._provider : null;
   const preserveDocumentUrls = routedProvider === "cheaperinference" || routedProvider === "cinf";
+  // OpenRouter documents `cache_control` on tool objects and on a lone text part. The other
+  // preserve providers (DashScope, Xiaomi) keep their existing shape: no change for them here.
+  const openRouterMarkers = routedProvider === "openrouter";
   // #2069 — when the routed provider honors OpenAI-format cache_control breakpoints
   // (DashScope/alibaba, etc.) and the upstream caller requested preservation, keep
   // the client's cache_control markers on system + message text blocks instead of
@@ -226,7 +260,12 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   if (body.messages && Array.isArray(body.messages)) {
     for (let i = 0; i < body.messages.length; i++) {
       const msg = body.messages[i];
-      const converted = convertClaudeMessage(msg, preserveCacheControl, preserveDocumentUrls);
+      const converted = convertClaudeMessage(
+        msg,
+        preserveCacheControl,
+        preserveDocumentUrls,
+        openRouterMarkers
+      );
       if (converted) {
         // Claude Code hook contexts (SessionStart/PreToolUse) arrive as
         // role:"system" mid-array — strictly valid for the Anthropic Messages
@@ -321,6 +360,9 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
             // carry over; omitted stays omitted (non-strict on Chat).
             ...chatStrictFrom(record),
           },
+          ...(preserveCacheControl && openRouterMarkers && record.cache_control !== undefined
+            ? { cache_control: record.cache_control }
+            : {}),
         };
       })
       .filter((tool): tool is JsonRecord => Boolean(tool));
@@ -345,7 +387,10 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
   // Reasoning effort: map Claude-side thinking controls to OpenAI reasoning_effort.
   // Priority: output_config.effort > enabled thinking budget > explicit opt-out fallback.
   // Budget buckets match the reverse mapping in thinkingBudget.ts::setCustomBudget.
-  const outputEffort = normalizeOpenAIReasoningEffort(body.output_config?.effort) || "";
+  const outputEffort =
+    lastSystemDirectiveEffort(body.messages) ||
+    normalizeOpenAIReasoningEffort(body.output_config?.effort) ||
+    "";
   if (outputEffort) {
     result.reasoning_effort = outputEffort;
   } else if (body.thinking?.type === "enabled" && typeof body.thinking.budget_tokens === "number") {
@@ -386,14 +431,19 @@ export function claudeToOpenAIRequest(model, body, stream, credentials: unknown 
 // Tool messages whose tool_call_id matches no assistant.tool_calls are dropped here
 // (supersedes the standalone #4385 orphan filter — same drop behavior, plus ordering).
 function regroupToolMessages(messages: JsonRecord[]): JsonRecord[] {
-  // tool_call_id -> index of the assistant message that issued it (first wins).
-  const callIdToAssistant = new Map<string, number>();
+  // tool_call_id -> FIFO of assistant indexes that issued it. An id is only unique
+  // within one assistant turn (agent sessions reuse `call_0`-style ids), so each
+  // tool message pairs with the oldest assistant that still lacks a result for it;
+  // first-wins dropped the 2nd real result and left the 2nd turn unanswered.
+  const openAssistantsByCallId = new Map<string, number[]>();
   messages.forEach((msg, idx) => {
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls as { id?: string }[]) {
-        if (tc.id && !callIdToAssistant.has(String(tc.id))) {
-          callIdToAssistant.set(String(tc.id), idx);
-        }
+        if (!tc.id) continue;
+        const callId = String(tc.id);
+        const queue = openAssistantsByCallId.get(callId);
+        if (queue) queue.push(idx);
+        else openAssistantsByCallId.set(callId, [idx]);
       }
     }
   });
@@ -403,8 +453,8 @@ function regroupToolMessages(messages: JsonRecord[]): JsonRecord[] {
   for (const msg of messages) {
     if (msg.role !== "tool") continue;
     const callId = String(msg.tool_call_id ?? "");
-    const assistantIdx = callIdToAssistant.get(callId);
-    if (assistantIdx === undefined) continue; // orphan -> drop
+    const assistantIdx = callId ? openAssistantsByCallId.get(callId)?.shift() : undefined;
+    if (assistantIdx === undefined) continue; // orphan or already paired -> drop
     let group = toolsByAssistant.get(assistantIdx);
     if (!group) {
       group = new Map();
@@ -522,9 +572,22 @@ function buildOmittedBlocksNotice(types: string[]): string {
   return [...safe].map((t) => `[${t} block omitted: not supported on this route]`).join("\n");
 }
 
+// One plain text part collapses to a string. With `keepMarked`, a part that carries a cache_control
+// marker keeps its array form, or the breakpoint is lost (the last user turn of a Claude Code
+// request is one).
+function textOrParts(parts: JsonRecord[], keepMarked: boolean) {
+  const single = parts.length === 1 && parts[0].type === "text";
+  return single && !(keepMarked && parts[0].cache_control !== undefined) ? parts[0].text : parts;
+}
+
 // Convert single Claude message - returns single message or array of messages
 /** Convert Claude message blocks while retaining tools and typed attachments. */
-function convertClaudeMessage(msg, preserveCacheControl = false, preserveDocumentUrls = false) {
+function convertClaudeMessage(
+  msg,
+  preserveCacheControl = false,
+  preserveDocumentUrls = false,
+  openRouterMarkers = false
+) {
   // Preserve system role for mid-conversation system turns (#6954).
   // Previously any role that wasn't "user" or "tool" was mapped to "assistant",
   // which misattributed system messages as assistant output.
@@ -687,8 +750,7 @@ function convertClaudeMessage(msg, preserveCacheControl = false, preserveDocumen
     // If has tool results, return array of tool messages
     if (toolResults.length > 0) {
       if (parts.length > 0) {
-        const textContent = parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts;
-        return [...toolResults, { role: "user", content: textContent }];
+        return [...toolResults, { role: "user", content: textOrParts(parts, openRouterMarkers) }];
       }
       return toolResults;
     }
@@ -697,7 +759,7 @@ function convertClaudeMessage(msg, preserveCacheControl = false, preserveDocumen
     if (toolCalls.length > 0) {
       const result: JsonRecord = { role: "assistant" };
       if (parts.length > 0) {
-        result.content = parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts;
+        result.content = textOrParts(parts, openRouterMarkers);
       }
       result.tool_calls = toolCalls;
       if (reasoningContent !== null) {
@@ -710,7 +772,7 @@ function convertClaudeMessage(msg, preserveCacheControl = false, preserveDocumen
     if (parts.length > 0) {
       const result: JsonRecord = {
         role,
-        content: parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts,
+        content: textOrParts(parts, openRouterMarkers),
       };
       if (reasoningContent !== null && role === "assistant") {
         result.reasoning_content = reasoningContent;

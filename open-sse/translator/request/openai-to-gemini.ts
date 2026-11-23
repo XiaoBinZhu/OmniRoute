@@ -8,7 +8,7 @@ import {
 import {
   generateAntigravityRequestId,
   getAntigravityEnvelopeUserAgent,
-  getAntigravitySessionId,
+  getAntigravityConversationSessionId,
 } from "../../services/antigravityIdentity.ts";
 import { fixToolPairs } from "../../services/contextManager.ts";
 import {
@@ -20,6 +20,7 @@ import { getModelSpec } from "../../../src/shared/constants/modelSpecs.ts";
 import {
   gemini38ThinkingConfig,
   isGeminiThinkingLevelModel,
+  resolveNativeGeminiThinking,
 } from "../../services/thinkingBudget.ts";
 
 import {
@@ -142,6 +143,19 @@ function convertOpenAIToolChoiceToGemini(choice: unknown): GeminiFunctionCalling
   return { mode: "VALIDATED" };
 }
 
+// A tool message content may be an array of text parts. Gemini should see the text itself,
+// not a JSON list of {type, text} objects. Arrays with any other part stay as they are.
+function joinToolTextParts(content: unknown): unknown {
+  if (!Array.isArray(content) || content.length === 0) return content;
+  const texts: string[] = [];
+  for (const part of content) {
+    const record = part as { type?: unknown; text?: unknown } | null;
+    if (record?.type !== "text" || typeof record.text !== "string") return content;
+    texts.push(record.text);
+  }
+  return texts.join("\n");
+}
+
 type CloudCodeEnvelope = {
   project: string;
   model?: string;
@@ -187,10 +201,10 @@ type GeminiToolNameOptions = {
 // from the incoming OpenAI-format body, honoring both the camelCase and
 // snake_case spellings at the top level and nested under
 // generationConfig.thinkingConfig (the operator payload-override surface).
-// Returns the trimmed non-empty level, or null when no level was supplied — an
-// empty/whitespace string is treated as "no level" so it can never disagree
-// with the extraction that later writes the field onto the request.
-function extractExplicitThinkingLevel(body: Record<string, unknown>): string | null {
+// Native thinking-level models require supported enum values. Preserve the
+// pre-existing passthrough for models that do not use native thinking levels.
+function extractExplicitThinkingLevel(body: Record<string, unknown>, model: string): string | null {
+  const validatesNativeLevel = isGeminiThinkingLevelModel(model);
   const gc = body.generationConfig as Record<string, unknown> | undefined;
   const tc = gc?.thinkingConfig as Record<string, unknown> | undefined;
   const tcSnake = gc?.thinking_config as Record<string, unknown> | undefined;
@@ -201,7 +215,14 @@ function extractExplicitThinkingLevel(body: Record<string, unknown>): string | n
     body.thinking_level,
   ];
   for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim() !== "") return candidate.trim();
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    if (!validatesNativeLevel) return trimmed;
+    const level = trimmed.toLowerCase();
+    if (level === "minimal" || level === "low" || level === "medium" || level === "high") {
+      return level;
+    }
   }
   return null;
 }
@@ -213,6 +234,23 @@ type GeminiBaseOptions = {
   // historical promotion, so it stays off unless the Cloud Code caller sets it.
   keepMixedGoogleSearchCallable?: boolean;
 };
+
+const BILLING_LINE_RE = /^x-anthropic-billing-header:[^\n]*(?:\r?\n)?/i;
+
+/**
+ * Drop Claude Code's `x-anthropic-billing-header:` line from a system message. It rotates every
+ * turn, so it breaks the prompt prefix cache, and it means nothing to Gemini. Strip each text part
+ * on its own: extractTextContent joins parts without a separator.
+ */
+function stripBillingLine(content: unknown): unknown {
+  if (typeof content === "string") return content.replace(BILLING_LINE_RE, "");
+  if (!Array.isArray(content)) return content;
+  return content.map((part) =>
+    part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+      ? { ...part, text: (part as { text: string }).text.replace(BILLING_LINE_RE, "") }
+      : part
+  );
+}
 
 // Core: Convert OpenAI request to Gemini format (base for all variants)
 function openaiToGeminiBase(
@@ -233,7 +271,7 @@ function openaiToGeminiBase(
   // directly) makes the numeric budget injected below redundant — and Google's
   // 3.x migration guidance documents `thinkingBudget` as deprecated — so the
   // level wins and no budget is set. Only the string level is forwarded.
-  const explicitThinkingLevel = extractExplicitThinkingLevel(body);
+  const explicitThinkingLevel = extractExplicitThinkingLevel(body, model);
   const toolNameMap = new Map<string, string>();
   const sanitizeToolName = (name: string) =>
     sanitizeGeminiToolName(name, {
@@ -247,13 +285,14 @@ function openaiToGeminiBase(
   }
 
   // Generation config
-  if (body.temperature !== undefined) {
+  const allowSampling = !/(?:^|\/)gemini-4(?:$|[-.])/i.test(model);
+  if (allowSampling && body.temperature !== undefined) {
     result.generationConfig.temperature = body.temperature;
   }
-  if (body.top_p !== undefined) {
+  if (allowSampling && body.top_p !== undefined) {
     result.generationConfig.topP = body.top_p;
   }
-  if (body.top_k !== undefined) {
+  if (allowSampling && body.top_k !== undefined) {
     result.generationConfig.topK = body.top_k;
   }
   // `stop: null` is how many OpenAI-compatible clients serialize "no stop"; wrapping it
@@ -280,7 +319,10 @@ function openaiToGeminiBase(
   // Models without thinking support (TTS, transcription, gemini-2.5-flash-image)
   // 400 on ANY thinkingConfig, so every path below skips them (#16928).
   const rejectsThinkingConfig = geminiModelRejectsThinkingConfig(model);
-  if (model.startsWith("gemma-4") || rejectsThinkingConfig) {
+  const nativeThinking = rejectsThinkingConfig ? null : resolveNativeGeminiThinking(model, body);
+  if (nativeThinking !== null) {
+    result.generationConfig.thinkingConfig = nativeThinking;
+  } else if (model.startsWith("gemma-4") || rejectsThinkingConfig) {
     // gemma-4 models returns - 400: Thinking budget is not supported for this model
   } else {
     // 1. OpenAI format: reasoning_effort (none/low/medium/high/auto/max/xhigh)
@@ -445,7 +487,7 @@ function openaiToGeminiBase(
   if (messages && Array.isArray(messages)) {
     for (const msg of messages) {
       if (msg.role === "tool" && msg.tool_call_id) {
-        toolResponses[msg.tool_call_id as string] = msg.content;
+        toolResponses[msg.tool_call_id as string] = joinToolTextParts(msg.content);
       }
     }
   }
@@ -458,7 +500,7 @@ function openaiToGeminiBase(
       const content = msg.content;
 
       if (role === "system" && messages.length > 1) {
-        const systemText = typeof content === "string" ? content : extractTextContent(content);
+        const systemText = extractTextContent(stripBillingLine(content));
         if (systemText) {
           if (!result.systemInstruction) {
             result.systemInstruction = {
@@ -596,7 +638,7 @@ function openaiToGeminiBase(
             const later = messages[j];
             if (later.role === "assistant" || later.role === "user") break;
             if (later.role === "tool" && later.tool_call_id) {
-              turnToolResponses[later.tool_call_id as string] = later.content;
+              turnToolResponses[later.tool_call_id as string] = joinToolTextParts(later.content);
             }
           }
 
@@ -648,11 +690,19 @@ function openaiToGeminiBase(
               }
               name = sanitizeToolName(name);
 
-              toolParts.push({
+              const converted = Array.isArray(resp) ? convertOpenAIContentToParts(resp) : [];
+              const media = converted.filter((part) => part.inlineData || part.fileData);
+              const resultData = media.length
+                ? converted
+                    .filter((part) => typeof part.text === "string")
+                    .map((part) => part.text)
+                    .join("\n")
+                : resp;
+              toolParts.push(...media, {
                 functionResponse: {
                   ...(toolNameOptions.stripFunctionCallId ? {} : { id: fid }),
                   name: name,
-                  response: { result: sanitizeFunctionResponseData(resp) },
+                  response: { result: sanitizeFunctionResponseData(resultData) },
                 },
               });
             }
@@ -753,9 +803,21 @@ function openaiToGeminiBase(
       result.tools.push({ googleSearch: {} });
     }
     if (result.tools.some((tool) => (tool.functionDeclarations?.length ?? 0) > 0)) {
-      result.toolConfig = {
-        functionCallingConfig: convertOpenAIToolChoiceToGemini(body.tool_choice),
-      };
+      const functionCallingConfig = convertOpenAIToolChoiceToGemini(body.tool_choice);
+      // The forced name must match the DECLARED (sanitized) name or Gemini rejects
+      // the config, so map it through the table buildGeminiTools filled above. A
+      // name that matches no declared tool is left as the client sent it.
+      if (functionCallingConfig.allowedFunctionNames) {
+        functionCallingConfig.allowedFunctionNames = functionCallingConfig.allowedFunctionNames.map(
+          (name) => {
+            for (const [sanitizedName, rawName] of toolNameMap.entries()) {
+              if (rawName === name) return sanitizedName;
+            }
+            return name;
+          }
+        );
+      }
+      result.toolConfig = { functionCallingConfig };
     }
   } else if (hasGoogleSearch) {
     result.tools = [{ googleSearch: {} }];
@@ -856,6 +918,26 @@ export function openaiToCloudCodeGeminiRequest(
   return request;
 }
 
+/**
+ * Prepend client system parts to the first user message so they still guide the model's
+ * behavior early in the conversation (#9030). A history that opens with a model turn gets a new
+ * user turn instead: a system text there would read as a model utterance.
+ */
+function prependClientSystemParts(
+  request: CloudCodeEnvelope["request"],
+  clientParts: GeminiPart[]
+) {
+  if (clientParts.length === 0) return;
+  const first = request.contents?.[0];
+  if (first && first.role === "user") {
+    first.parts.unshift(...clientParts);
+  } else if (first) {
+    request.contents.unshift({ role: "user", parts: [...clientParts] });
+  } else {
+    request.contents = [{ role: "user", parts: [...clientParts] }];
+  }
+}
+
 function wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials = null) {
   // Fall back to providerSpecificData.projectId — some connections (and post-refresh
   // credentials) store it there rather than at the top level, which otherwise produced a
@@ -881,7 +963,10 @@ function wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials = null) {
     project: projectId,
     requestId: generateAntigravityRequestId(),
     request: {
-      sessionId: getAntigravitySessionId(credentials),
+      sessionId: getAntigravityConversationSessionId(
+        credentials,
+        (credentials as { _antigravitySessionKey?: string } | null)?._antigravitySessionKey
+      ),
       contents: cloudCodeRequest.contents,
       systemInstruction: cloudCodeRequest.systemInstruction,
       generationConfig: applyAntigravityGenerationDefaults(cloudCodeRequest.generationConfig),
@@ -905,16 +990,7 @@ function wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials = null) {
   const defaultPart: GeminiPart = { text: ANTIGRAVITY_DEFAULT_SYSTEM };
   const clientParts = envelope.request.systemInstruction?.parts?.slice() ?? [];
   envelope.request.systemInstruction = { role: "system", parts: [defaultPart] };
-
-  if (clientParts.length > 0) {
-    // Prepend client system parts to the first user message so they still guide
-    // the model's behavior early in the conversation.
-    if (envelope.request.contents && envelope.request.contents.length > 0) {
-      envelope.request.contents[0].parts.unshift(...clientParts);
-    } else {
-      envelope.request.contents = [{ role: "user", parts: [...clientParts] }];
-    }
-  }
+  prependClientSystemParts(envelope.request, clientParts);
 
   // Strip Gemini built-in tool *names* out of functionDeclarations — but only while
   // a native grounding entry (e.g. `{ googleSearch: {} }`) is actually present.
@@ -1001,29 +1077,14 @@ export function openaiToAntigravityRequest(model, body, stream, credentials = nu
 
   const envelope = wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials);
 
-  // Match real Antigravity client: don't send maxOutputTokens when the user
-  // hasn't explicitly specified max_tokens / max_completion_tokens.
-  // The Cloud Code server decides the output limit on its own.
-  // Note: read hasThinking BEFORE stripping thinkingConfig below — for Claude
-  // models the Cloud Code envelope still carries a thinkingBudget set upstream
-  // by applyAntigravityGenerationDefaults, which we must consult here so we
-  // do not accidentally drop the maxOutputTokens it bumped for us.
+  // Requests without an explicit limit use the native upstream default.
   const clientRequestedMaxTokens = body.max_tokens ?? body.max_completion_tokens;
-  const hasThinking = !!envelope.request?.generationConfig?.thinkingConfig?.thinkingBudget;
-  if (
-    clientRequestedMaxTokens === undefined &&
-    !(isClaude && hasThinking) &&
-    envelope.request?.generationConfig
-  ) {
+  if (clientRequestedMaxTokens == null && envelope.request?.generationConfig) {
     delete envelope.request.generationConfig.maxOutputTokens;
   }
 
   // Claude models on Antigravity use their own native thinking — Gemini's thinkingConfig
   // is not understood by the Cloud Code Claude endpoint and must be stripped.
-  // applyAntigravityGenerationDefaults (inside wrapInCloudCodeEnvelope) already bumped
-  // maxOutputTokens to thinkingBudget+1 before we get here, so the budget is preserved.
-  // Must run AFTER the hasThinking-derived maxOutputTokens decision above so the
-  // budget is accounted for before the field is removed.
   if (isClaude && envelope.request?.generationConfig) {
     delete envelope.request.generationConfig.thinkingConfig;
   }

@@ -1,7 +1,15 @@
-import { createSseTextTransform, type FieldCategory } from "./sseTextTransform";
+import {
+  createSseTextTransform,
+  classifyField,
+  omitEmittedOpaqueReasoningFromFlush,
+  type FieldCategory,
+} from "./sseTextTransform";
+import { resolveStreamIndices } from "./streamIndices";
 import {
   bufferField,
+  ensureResponsesTextDeltaIds,
   flushOpenAiTextBuffers,
+  responsesTextTailDelta,
   type BufferedField,
   type TextBuffers,
 } from "./sseTextBuffers";
@@ -246,7 +254,7 @@ function redactOutsideDataUrls(text: string): string {
   return rebuilt + redactCredentials(text.slice(cursor)).text;
 }
 
-type ChoiceBufferStore = {
+export type ChoiceBufferStore = {
   buffers: Map<string, TextBuffers>;
   get: (index: string | number) => TextBuffers;
   takeAll: () => Array<[string, TextBuffers]>;
@@ -285,6 +293,15 @@ function createChoiceBufferStore(maxBufferedChoices: number): ChoiceBufferStore 
       }
     },
   };
+}
+
+/** Bytes still held across every block's buffers (what the buffering limit charges). */
+function countBufferedBytes(store: ChoiceBufferStore): number {
+  let total = 0;
+  for (const buffers of store.buffers.values()) {
+    for (const value of Object.values(buffers)) total += value.length;
+  }
+  return total;
 }
 
 function hasRemainingBuffers(store: ChoiceBufferStore): boolean {
@@ -333,15 +350,13 @@ function claudeBlockDeltas(index: number, buffers: TextBuffers): Array<Record<st
   return frames;
 }
 
-// Claude content blocks buffer under `<blockIndex>_0` (#18006) and stream one after
-// another, so at any stop signal (a block's own content_block_stop, message_delta,
-// message_stop or the end of the stream) every block that still holds a tail is drained
-// in block order. For a well-formed stream that is exactly the block being closed; it also
-// covers a block whose content_block_stop never arrived.
-function flushClaudeFormat(store: ChoiceBufferStore, _lastJson: Record<string, unknown>): unknown {
+/** Drain the closing block only; message termination and EOF still drain all remaining blocks. */
+function flushClaudeFormat(store: ChoiceBufferStore, lastJson: Record<string, unknown>): unknown {
   const frames: Array<Record<string, unknown>> = [];
+  const closingKey = `${typeof lastJson.index === "number" ? lastJson.index : 0}_0`;
   const entries = store
     .takeAll()
+    .filter(([key]) => lastJson.type !== "content_block_stop" || key === closingKey)
     .map(([key, buffers]) => [parseInt(key.split("_")[0] || "0", 10), buffers] as const)
     .sort((a, b) => a[0] - b[0]);
   for (const [index, buffers] of entries) frames.push(...claudeBlockDeltas(index, buffers));
@@ -372,7 +387,7 @@ function flushResponsesFormat(
       buffers.reasoning = "";
     }
     if (!parts.length) return null;
-    return { type: "response.output_text.delta", output_index: idx, delta: parts.join("") };
+    return responsesTextTailDelta(lastJson, idx, parts.join(""));
   }
   const finalJson = JSON.parse(JSON.stringify(lastJson)) as Record<string, unknown>;
   if (buffers.content) {
@@ -387,6 +402,7 @@ function flushResponsesFormat(
     finalJson.reasoning = buffers.reasoning;
     buffers.reasoning = "";
   }
+  ensureResponsesTextDeltaIds(finalJson, idx);
   return finalJson;
 }
 
@@ -419,56 +435,55 @@ function flushGenericFormat(
   templateJson: Record<string, unknown>
 ): Record<string, unknown> {
   const finalJson = JSON.parse(JSON.stringify(templateJson)) as Record<string, unknown>;
+  omitEmittedOpaqueReasoningFromFlush(finalJson);
   clearStringFields(finalJson);
   populateRemainingBuffers(store, finalJson, 0, 0);
   store.clearAll();
   return finalJson;
 }
 
-function clearStringFields(obj: unknown): void {
+function clearStringFields(obj: unknown, parentKey = ""): void {
   if (!obj || typeof obj !== "object") return;
-  for (const key of Object.keys(obj as Record<string, unknown>)) {
-    const record = obj as Record<string, unknown>;
-    if (typeof record[key] === "string") record[key] = "";
-    else if (record[key] && typeof record[key] === "object") clearStringFields(record[key]);
+  const record = obj as Record<string, unknown>;
+  const isArray = Array.isArray(obj);
+  for (const key of Object.keys(record)) {
+    if (typeof record[key] === "string") {
+      if (classifyField(key, parentKey) !== null) record[key] = "";
+    } else if (record[key] && typeof record[key] === "object") {
+      clearStringFields(record[key], isArray ? parentKey : key);
+    }
   }
-}
-
-function resolveCompositeIndexes(
-  record: Record<string, unknown>,
-  currentChoiceIdx: number,
-  currentToolIdx: number
-): { choiceIdx: number; toolIdx: number } {
-  const indexValue = record.index;
-  if (typeof indexValue !== "number")
-    return { choiceIdx: currentChoiceIdx, toolIdx: currentToolIdx };
-  if (record.delta || record.message || record.finish_reason)
-    return { choiceIdx: indexValue, toolIdx: currentToolIdx };
-  if (record.function || record.id || record.type === "function")
-    return { choiceIdx: currentChoiceIdx, toolIdx: indexValue };
-  return { choiceIdx: indexValue, toolIdx: currentToolIdx };
 }
 
 function populateRemainingBuffers(
   store: ChoiceBufferStore,
   obj: unknown,
   currentChoiceIdx = 0,
-  currentToolIdx = 0
+  currentToolIdx = 0,
+  parentKey = ""
 ): void {
   if (!obj || typeof obj !== "object") return;
   const record = obj as Record<string, unknown>;
-  const { choiceIdx, toolIdx } = resolveCompositeIndexes(record, currentChoiceIdx, currentToolIdx);
+  const { choiceIdx, toolIdx } = resolveStreamIndices(
+    record,
+    currentChoiceIdx,
+    currentToolIdx,
+    parentKey
+  );
   const compositeKey = `${choiceIdx}_${toolIdx}`;
+  const isArray = Array.isArray(obj);
   for (const key of Object.keys(record)) {
     if (typeof record[key] === "string") {
+      const category = classifyField(key, parentKey);
+      if (category === null) continue;
       const choiceBuf = store.get(compositeKey);
-      const bucket = key === "arguments" || key === "partial_json" ? "toolArgs" : "content";
+      const bucket = bufferField(category, key);
       if (choiceBuf[bucket]) {
         record[key] = ((record[key] as string) || "") + choiceBuf[bucket];
         choiceBuf[bucket] = "";
       }
     } else if (record[key] && typeof record[key] === "object") {
-      populateRemainingBuffers(store, record[key], choiceIdx, toolIdx);
+      populateRemainingBuffers(store, record[key], choiceIdx, toolIdx, isArray ? parentKey : key);
     }
   }
 }
@@ -590,7 +605,9 @@ function appendAndDrain(
   return continuation.emitted + emitted;
 }
 
-function flushRemainingByShape(
+// Shared with the PII token detokenizer (src/lib/pii/detokenizeSseTransform.ts), which holds
+// back token prefixes in the same per-choice buffers and drains them with the same frames.
+export function flushRemainingByShape(
   store: ChoiceBufferStore,
   lastJson: unknown,
   lastContentJson: unknown
@@ -618,6 +635,11 @@ function flushEmptyStream(
   return remaining;
 }
 
+/**
+ * Mask credentials across SSE fragments with bounded per-lane buffers and fail-closed limits,
+ * retaining independent bounded tails for each streamed block. Snapshots are masked directly;
+ * drained Responses lanes release their continuation state.
+ */
 export function createCredentialSseTransform(
   options?: CredentialTransformOptions
 ): TransformStream {
@@ -647,20 +669,28 @@ export function createCredentialSseTransform(
   };
   const getBuffers = store.get;
 
+  /** Finalize only the closing Claude block so other blocks keep their masking context. */
   const onFlush = (
     lastJson: unknown,
     isJsonStream = false,
     lastContentJson: unknown = null
   ): unknown => {
-    for (const [, buffers] of store.takeAll()) {
+    const last = lastJson as Record<string, unknown> | null;
+    const closingKey = `${typeof last?.index === "number" ? last.index : 0}_0`;
+    for (const [index, buffers] of store.takeAll()) {
+      if (last?.type === "content_block_stop" && index !== closingKey) continue;
       for (const key of Object.keys(buffers) as BufferedField[]) {
         if (buffers[key]) buffers[key] = markUnclosedBeginHead(redactOutsideDataUrls(buffers[key]));
       }
     }
-    bufferedBytes = 0;
-    if (!hasRemainingBuffers(store)) return null;
-    if (!lastJson) return flushEmptyStream(getBuffers, isJsonStream);
-    return flushRemainingByShape(store, lastJson, lastContentJson);
+    const flushed = !hasRemainingBuffers(store)
+      ? null
+      : !lastJson
+        ? flushEmptyStream(getBuffers, isJsonStream)
+        : flushRemainingByShape(store, lastJson, lastContentJson);
+    // A per-block flush leaves other tails in memory; keep them charged against the limit.
+    bufferedBytes = countBufferedBytes(store);
+    return flushed;
   };
 
   const processor = (
@@ -676,5 +706,10 @@ export function createCredentialSseTransform(
     return appendAndDrain(state, store, field, index, text, isStopSignal);
   };
 
-  return createSseTextTransform(processor, onFlush, undefined, { processToolArgs: true });
+  return createSseTextTransform(processor, onFlush, undefined, {
+    processToolArgs: true,
+    // Only after a Responses lane is drained: dropping the buffer also drops its
+    // WeakMap-backed overflow continuation state without recycling identities.
+    releaseResponsesLane: (index) => store.buffers.delete(index),
+  });
 }

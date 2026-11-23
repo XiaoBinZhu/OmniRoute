@@ -392,6 +392,30 @@ describe("conn-modals (Phase 1c extraction)", () => {
     expect(c.textContent).not.toContain("test-p...78b9");
   });
 
+  it("EditConnectionModal shows a stored-mask API key as its last 4 characters only", () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const connection = {
+      id: "conn-masked-key",
+      name: "Masked Connection",
+      provider: "openai",
+      authType: "apikey",
+      priority: 1,
+      apiKey: "sk-proj-****a82f",
+    };
+    const c = renderModal(
+      <EditConnectionModal
+        isOpen={true}
+        connection={connection}
+        providerId="openai"
+        onSave={onSave}
+        onClose={vi.fn()}
+      />
+    );
+
+    expect(c.textContent).toContain("sk-••••••••a82f");
+    expect(c.textContent).not.toContain("sk-proj-****a82f");
+  });
+
   it("EditConnectionModal renders OpenRouter preset when provider comes from the page", () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     const connection = {
@@ -435,16 +459,18 @@ describe("conn-modals (Phase 1c extraction)", () => {
       />
     );
 
-    // The region picker is the kit (Radix) Select since KEA-7886: a combobox trigger
-    // labelled by the field, showing the selected option's label ("… (Beijing)").
+    // The region picker is the kit NativeSelect since #19620 (OS picker on phones): a real
+    // <select> labelled by the field, with the stored region selected ("… (Beijing)").
     const regionLabel = Array.from(c.querySelectorAll("label")).find((label) =>
       label.textContent?.includes("apiRegionLabel")
     );
-    const regionSelect = regionLabel ? document.getElementById(regionLabel.htmlFor) : null;
-    expect(regionSelect?.getAttribute("role")).toBe("combobox");
+    const regionSelect = regionLabel
+      ? (document.getElementById(regionLabel.htmlFor) as HTMLSelectElement | null)
+      : null;
+    expect(regionSelect?.tagName).toBe("SELECT");
     expect(kitSelectValue(regionSelect!)).toBe("china-beijing");
-    expect(regionSelect?.textContent).toContain("(Beijing)");
-    expect(regionSelect?.textContent).not.toContain("(Singapore)");
+    expect(regionSelect?.selectedOptions[0]?.textContent).toContain("(Beijing)");
+    expect(regionSelect?.selectedOptions[0]?.textContent).not.toContain("(Singapore)");
   });
 
   it("EditConnectionModal renders without ReferenceError for oauth connection", () => {
