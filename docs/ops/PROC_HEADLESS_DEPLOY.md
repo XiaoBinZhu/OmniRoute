@@ -60,6 +60,59 @@ npm run build:backend     # OMNIROUTE_BUILD_BACKEND_ONLY=1 node scripts/build/bu
 npm run build             # full build (dashboard included)
 ```
 
+### 2.2 Runtime choice: Node is the default, Bun is a measured downgrade
+
+The gateway image is Node (`runner-base`). A Bun-runtime variant exists
+(`runner-bun`, `oven/bun:1.4.3-slim`) but **it is not the default, and it is not a
+memory win** — measured on the 2 vCPU / 3.7 GB gateway host with the same commit and
+the same `builder` artifact, idle and warm:
+
+| metric                  | Node `:proc-<sha>` | Bun `:proc-bun-<sha>`  |
+| ----------------------- | ------------------ | ---------------------- |
+| cgroup `memory.current` | **316.8 MiB**      | **413.6 MiB** (+30.6%) |
+| cgroup `memory.peak`    | 356.9 MiB          | 552.9 MiB              |
+| PID 1 `VmRSS`           | 57.8 MiB           | 25.5 MiB               |
+
+The main process looks smaller under Bun because JSC's heap and compiled-code cache
+live outside PID 1's RSS — but they are still charged to the cgroup, which is what a
+4 GB host runs out of. Two further constraints:
+
+- `bun run build` **cannot** produce this artifact (`module.createRequire failed
+parsing argument` → `Could not parse output from TypeScript's --showConfig`), which
+  is why `runner-bun` copies the **Node-built** standalone instead of building.
+- Upstream tracks Bun as a best-effort compatibility target, not a supported runtime.
+
+Use it only if you specifically need `bun:sqlite`/Bun semantics, and deploy it with:
+
+```bash
+OMNIROUTE_IMAGE=<repo>:proc-bun-<sha12>
+OMNIROUTE_HEALTHCHECK='bun healthcheck.mjs'
+```
+
+`docker-compose.proc.yml` reads the probe from `OMNIROUTE_HEALTHCHECK` for exactly this
+reason: `node` inside the Bun image is not the Bun runtime, so a hard-coded `node
+healthcheck.mjs` would report a healthy container as unhealthy and trip the auto-rollback.
+
+### 2.3 Model names: use a same-name combo, never a model alias
+
+When the platform sends bare model names (`u2-flash`) but the credentials live on a
+custom node (`openai-compatible-chat-ch8`), the obvious mapping — `PUT
+/api/settings/model-aliases {"u2-flash":"openai-compatible-chat-ch8/u2-flash"}` — **breaks
+inference**: the alias layer rewrites the already-prefixed id a second time and you get
+`404 The model ... does not exist` or `401 No active credentials for provider`.
+
+Create a **combo whose name is the platform model name** instead, pointing at the
+prefixed model. That resolves without touching the caller:
+
+```bash
+POST /api/combos
+{"name":"u2-flash","models":[{"model":"openai-compatible-chat-ch8/u2-flash"}],"strategy":"priority"}
+```
+
+Then sync each connection's catalogue so the node knows its models
+(`POST /api/providers/<connectionId>/sync-models` — note: the id is the **connection
+UUID**, not the provider id).
+
 ### 2.1 Headless runtime
 
 `OMNIROUTE_HEADLESS=1` (or `omniroute serve --headless`) is the runtime counterpart. It is
@@ -101,10 +154,12 @@ trees) — tracked as a separate change, not a deployment prerequisite.
 
 Push to `proc`, or run **Actions → deploy-proc → Run workflow**:
 
-| input       | effect                                                                                |
-| ----------- | ------------------------------------------------------------------------------------- |
-| `build_web` | also build `:proc-web-<sha>` (full dashboard image)                                   |
-| `deploy`    | deploy the freshly built core image (only when `DEPLOY_ENABLED=true` on a manual run) |
+| input          | effect                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------- |
+| `build_web`    | also build `:proc-web-<sha>` (full dashboard image)                                         |
+| `deploy`       | deploy the freshly built image (only when `DEPLOY_ENABLED=true` on a manual run)            |
+| `deploy_image` | `core` (headless API) or `web` (dashboard). `web` requires `build_web=true` in the same run |
+| `build_bun`    | also build `:proc-bun-<sha>` (Bun runtime, same Node-built artifact)                        |
 
 The build job publishes:
 
@@ -112,19 +167,36 @@ The build job publishes:
 <IMAGE_REPOSITORY>:proc-<sha12>     # immutable — deploy this
 <IMAGE_REPOSITORY>:proc             # moving alias of the same digest
 <IMAGE_REPOSITORY>:proc-web-<sha12> # only with build_web=true
+<IMAGE_REPOSITORY>:proc-bun-<sha12> # only with build_bun=true
 ```
 
 `IMAGE_REPOSITORY` must be **lowercase** (for example `ghcr.io/xiaobinzhu/omniroute`). GHCR
 rejects uppercase repository names — the first attempt failed with
 `invalid tag "ghcr.io/XiaoBinZhu/omniroute:proc-…": repository name must be lowercase`.
 
+**"Backend first, then frontend, then deploy" as a push pipeline.** With the repository variable
+`DEPLOY_IMAGE_KIND=web`, a push to `proc` builds the headless core first, then the dashboard
+image (`build-web`), and only then deploys the **dashboard** image with `OMNIROUTE_HEADLESS=0`.
+`build-core` → `build-web` → `deploy` is expressed as job `needs`, so the order is enforced by the
+runner and a failed dashboard build leaves the previous release untouched. Leave
+`DEPLOY_IMAGE_KIND` unset (or `core`) to keep the headless API image as the deployed one; on a
+manual dispatch the `deploy_image` input takes precedence.
+
 The deploy job:
 
 1. copies `docker-compose.proc.yml` and `scripts/ops/proc-deploy.sh` to `DEPLOY_PATH`;
 2. logs the host in to GHCR with the read-only `GHCR_DEPLOY_TOKEN` (sent over SSH stdin, never on
    a command line);
-3. runs `proc-deploy.sh <image>`, which pulls, recreates with `--no-build`, waits for
-   `/healthz` **and** `/v1/models`, records the release and rolls back on failure.
+3. resolves the image (`core` or `web`) and its `OMNIROUTE_HEADLESS` value (`1`/`0`);
+4. runs `proc-deploy.sh <image>`, which pulls, recreates with `--no-build`, waits for `/healthz`
+   **and** `/v1/models`, records the release and rolls back on failure.
+
+The deploy script derives the container healthcheck from the image runtime (`node healthcheck.mjs`
+for `runner-base`, `bun healthcheck.mjs` for `runner-bun`) unless `OMNIROUTE_HEALTHCHECK` is set,
+and writes the non-secret deployment knobs (`OMNIROUTE_IMAGE`, `OMNIROUTE_HEALTHCHECK`,
+`OMNIROUTE_HEADLESS`, the memory ceilings) into the host `.env`. Without that, a later manual
+`docker compose up` would fall back to the compose defaults (`HEADLESS=1`, Node probe) and
+silently turn the dashboard image back into a headless one.
 
 ### 4.2 From a workstation with Docker (air-gapped hosts)
 
@@ -153,6 +225,28 @@ sh scripts/ops/proc-deploy.sh "$OMNIROUTE_IMAGE"
 A Windows workstation has no Docker/WSL in this environment, so the CI path is the supported one
 there — the image contains Linux native modules (`better-sqlite3`, `sqlite-vec`) and cannot be
 produced on Windows anyway.
+
+### 4.3 Verified run (2026-10-21, `b0316b682f`)
+
+The full "backend → frontend → deploy" chain was exercised end to end on the 43 box
+(2 vCPU / 3.7 GB, the host that cannot build):
+
+| step                                             | observed                                                               |
+| ------------------------------------------------ | ---------------------------------------------------------------------- |
+| `build-core`                                     | success (~11 min, `:proc-b0316b682fcd`)                                |
+| `build-web` (`needs: build-core`)                | success (`:proc-web-b0316b682fcd`)                                     |
+| `deploy` (`needs: [build-core, build-web]`)      | success                                                                |
+| host after deploy                                | `Up (healthy)`, `restarts=0`, `OOMKilled=false`                        |
+| `/healthz`, `/v1/models`, `/dashboard`, `/login` | 200, 401, 307, 200 (219,390 bytes)                                     |
+| container `OMNIROUTE_HEADLESS`                   | `0` (dashboard serving)                                                |
+| host `.env`                                      | `OMNIROUTE_IMAGE/HEALTHCHECK/HEADLESS/MEM_LIMIT/MEMORY_MB` persisted   |
+| bare `docker compose config` (no shell env)      | resolves to the deployed image, `HEADLESS="0"`, `node healthcheck.mjs` |
+| memory                                           | 384.8 MiB / 1.25 GiB (30%); host `available` 2221 MB                   |
+| old gateway                                      | `ai-gateway-1/2` untouched, still healthy                              |
+
+The `.env` write-back is what makes the last row reproducible: before it, a plain
+`docker compose up -d` would have re-resolved `OMNIROUTE_HEADLESS` to the compose default `1`
+and silently turned the dashboard image back into a headless one.
 
 ## 5. Verifying a deployment
 
